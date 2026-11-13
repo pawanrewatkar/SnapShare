@@ -120,6 +120,18 @@ function Popup() {
     { mode: 'screen', label: 'Screen / window', icon: <IconMonitor />, hint: 'Pick in Chrome' },
   ];
 
+  if (!loading && !session)
+    return (
+      <div className="flex w-[360px] flex-col items-center gap-3 p-6 text-center text-sm">
+        <Logo />
+        <h1 className="text-base font-semibold">Sign in to start</h1>
+        <p className="text-slate-500">SnapShare saves your screenshots and recordings to your own Google Drive in <b>SnapShare/Screenshots</b> and <b>SnapShare/Videos</b>. Files stay private until you share them.</p>
+        <Button variant="primary" className="w-full" loading={busy === 'auth'} onClick={() => void doSignIn()}>
+          Sign in with Google
+        </Button>
+      </div>
+    );
+
   return (
     <div className="w-[360px] p-4 text-sm">
       <header className="mb-4 flex items-center justify-between">

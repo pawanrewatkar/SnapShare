@@ -2,19 +2,26 @@ import { defineConfig, loadEnv, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
-/** Emits manifest.json with the API origin injected into host_permissions. */
-function manifestPlugin(apiBase: string, e2e: boolean): Plugin {
+const PLACEHOLDER_CLIENT_ID = 'REPLACE_WITH_YOUR_CLIENT_ID.apps.googleusercontent.com';
+
+/** Emits manifest.json with the OAuth client id (from VITE_GOOGLE_CLIENT_ID) and the stable extension key. */
+function manifestPlugin(clientId: string, e2e: boolean): Plugin {
   return {
     name: 'snapshare-manifest',
     generateBundle() {
       const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, 'manifest/manifest.json'), 'utf8'));
       const pkg = JSON.parse(readFileSync(resolve(import.meta.dirname, 'package.json'), 'utf8'));
       manifest.version = pkg.version;
-      const origin = new URL(apiBase).origin + '/*';
-      manifest.host_permissions = Array.from(new Set([...(manifest.host_permissions ?? []), origin, ...(e2e ? ['<all_urls>'] : [])]));
-      if (e2e) manifest.name += ' (E2E TEST BUILD)';
+      const keyPath = resolve(import.meta.dirname, 'manifest/public-key.txt');
+      if (existsSync(keyPath)) manifest.key = readFileSync(keyPath, 'utf8').trim();
+      if (!clientId) this.warn('VITE_GOOGLE_CLIENT_ID is not set: Google sign-in will be disabled in this build.');
+      manifest.oauth2 = { client_id: clientId || PLACEHOLDER_CLIENT_ID, scopes: ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/drive.file'] };
+      if (e2e) {
+        manifest.host_permissions = [...(manifest.host_permissions ?? []), '<all_urls>'];
+        manifest.name += ' (E2E TEST BUILD)';
+      }
       this.emitFile({ type: 'asset', fileName: 'manifest.json', source: JSON.stringify(manifest, null, 2) });
     },
   };
@@ -22,11 +29,10 @@ function manifestPlugin(apiBase: string, e2e: boolean): Plugin {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, import.meta.dirname, 'VITE_');
-  const apiBase = env.VITE_API_BASE_URL || 'http://localhost:3000';
+  const clientId = (env.VITE_GOOGLE_CLIENT_ID ?? '').trim();
   return {
-    plugins: [react(), tailwindcss(), manifestPlugin(apiBase, mode === 'e2e')],
+    plugins: [react(), tailwindcss(), manifestPlugin(clientId, mode === 'e2e')],
     resolve: { alias: { '@': resolve(import.meta.dirname, 'src') } },
-    define: { __API_BASE__: JSON.stringify(apiBase) },
     build: {
       outDir: mode === 'e2e' ? 'dist-e2e' : 'dist',
       emptyOutDir: true,

@@ -16,8 +16,8 @@ if (manifest.name.includes('E2E') || manifest.host_permissions?.includes('<all_u
   console.error('Refusing to package a test build (E2E / <all_urls>).');
   process.exit(1);
 }
-if (/localhost|127\.0\.0\.1/.test(JSON.stringify(manifest.host_permissions))) {
-  console.warn('WARNING: host_permissions point at localhost. Set VITE_API_BASE_URL to the production URL before building a release.');
+if (!manifest.oauth2?.client_id || manifest.oauth2.client_id.startsWith('REPLACE_')) {
+  console.warn('WARNING: no Google OAuth client id in this build (VITE_GOOGLE_CLIENT_ID). Capture/edit/record work; Google Drive sign-in will not.');
 }
 
 const crcTable = Array.from({ length: 256 }, (_, n) => {

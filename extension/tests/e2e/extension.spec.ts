@@ -22,6 +22,8 @@ test.beforeAll(async () => {
   let [sw] = ctx.serviceWorkers();
   if (!sw) sw = await ctx.waitForEvent('serviceworker');
   extId = new URL(sw.url()).host;
+  // Captures require Google sign-in; seed a signed-in account (no real Google calls are made by these tests).
+  await sw.evaluate(() => chrome.storage.local.set({ account: { id: 'e2e', email: 'e2e@example.com', name: 'E2E', avatarUrl: null } }));
 });
 test.afterAll(async () => ctx?.close());
 

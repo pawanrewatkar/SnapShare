@@ -4,7 +4,7 @@
  */
 import { platform } from '@/browser';
 import type { BackgroundRequest, CaptureMode } from '@/types/messages';
-import { completeRegion, runCapture } from './capture';
+import { completeRegion, requireSignIn, runCapture } from './capture';
 import { getSettings } from '@/services/settings';
 import {
   getRecordingState,
@@ -20,12 +20,14 @@ import {
 async function handle(msg: BackgroundRequest, sender: chrome.runtime.MessageSender): Promise<unknown> {
   switch (msg.type) {
     case 'capture':
+      await requireSignIn();
       return runCapture(msg.mode, msg.tabId);
     case 'region:result':
       return completeRegion(msg.rect, msg.viewportWidth ?? 0, sender.tab?.id);
     case 'screen:captured':
       return { ok: true };
     case 'rec:start':
+      await requireSignIn();
       return startRecording(msg.options);
     case 'rec:pause':
       return pauseRecording();
@@ -57,6 +59,7 @@ chrome.runtime.onMessage.addListener((msg: BackgroundRequest & { target?: string
 });
 
 chrome.commands?.onCommand.addListener(async (command) => {
+  if (!(await requireSignIn().then(() => true, () => false))) return;
   if (command === 'capture-default') {
     const { defaultCaptureMode } = await getSettings();
     void runCapture(defaultCaptureMode);
@@ -69,7 +72,8 @@ chrome.commands?.onCommand.addListener(async (command) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => void onTabRemoved(tabId));
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') void platform.openExtensionPage('settings.html?signin=1');
   void chrome.storage.local.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' });
   void chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' });
 });

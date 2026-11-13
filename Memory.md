@@ -1,5 +1,18 @@
 # SnapShare — project memory / hand-off
 
+## 2026-11-13 update — standalone mode (supersedes backend notes below for the extension)
+
+- Extension no longer calls the backend. Auth: `chrome.identity.getAuthToken` (`features/authentication/auth.ts`), client id injected from `VITE_GOOGLE_CLIENT_ID`; fixed extension key in `extension/manifest/public-key.txt` → ID `lepgoibhofiiheidakffpgglelpajjfp` (private key in git-ignored `extension/keys/`).
+- Drive client: `features/drive/driveApi.ts`; folders `SnapShare/{Screenshots,Videos}` per account (`driveFolders:<sub>` in storage.local), de-duplicated (`driveService.ts`). Edited images → Screenshots.
+- Gallery lists Drive live (`galleryApi.ts`); local captures linked to another account are hidden; deleted-in-Drive → "missing".
+- Sharing per file only (`features/sharing/ShareDialog.tsx`, `permissions.ts`): Gmail addresses, anyone-with-link after confirmation, copy file URL, revoke; inherited folder permissions are detected and warned.
+- Tests: extension 67 unit/mocked passed, 9 real-Chromium passed. Real two-account Google Drive isolation test: **BLOCKED** (no OAuth client/credentials yet).
+- `web/` and `supabase/` remain in the repo as optional legacy (branded links); not required.
+- Sign-in is mandatory: popup gate, `requireSignIn()` in `background/capture.ts` guards capture/recording/shortcuts, welcome page on install (`settings.html?signin=1`).
+- Auto-save to Drive always on: `maybeAutoUpload` after every capture and recording; editor Save uploads the edited image; failures → badge "!" + `lastAutoUploadError`, retry from Gallery.
+- **Blocked on:** a real OAuth client ID (`VITE_GOOGLE_CLIENT_ID`). Without it, nobody can sign in and so the extension cannot be used.
+
+
 _Last updated: 2026-11-06 (initial implementation session)._
 
 ## Architecture (decisions that matter)

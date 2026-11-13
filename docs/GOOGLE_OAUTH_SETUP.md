@@ -1,60 +1,53 @@
-# Google OAuth & Drive setup
+# Google OAuth setup (standalone extension, no backend)
 
-## Scopes (minimum required)
+SnapShare signs in with the **Chrome Identity API** using an OAuth client of type **Chrome Extension**. Each user stores files in **their own** Google Drive. No server, domain, Supabase or Vercel is needed.
 
-| Scope | Why | Google classification |
-| --- | --- | --- |
-| `openid`, `email`, `profile` | identify the user, show name/avatar | non-sensitive |
-| `https://www.googleapis.com/auth/drive.file` | create the SnapShare folders, upload, list, rename, delete and change sharing of **files SnapShare created** | non-sensitive (per Google's scope list at time of writing — confirm in the console when adding it) |
+## Values you need
 
-`drive.file` supports every operation SnapShare needs because SnapShare only ever touches files it created (folders and uploads carry `appProperties.snapshare=1`). It cannot see other Drive files. Consequences to know:
+| Item | Value |
+| --- | --- |
+| Extension ID (fixed by `extension/manifest/public-key.txt`) | `lepgoibhofiiheidakffpgglelpajjfp` |
+| Scopes | `openid`, `email`, `profile`, `https://www.googleapis.com/auth/drive.file` |
+| OAuth client type | Chrome Extension |
+| Audience | External |
 
-- Folders/files created through a **different OAuth client** (e.g. a separate dev project) are invisible to production, so SnapShare would create new folders. Use one OAuth client per environment and don't mix data.
-- If a user removes SnapShare's access in their Google account, the backend gets `invalid_grant`, marks the credential revoked and the extension asks them to sign in again.
+The extension ID stays the same on every PC because the manifest contains a fixed public key. Do **not** regenerate it (`scripts/generate-extension-key.mjs --force`) unless you also update the OAuth client.
 
-The full `drive` scope is **not** used (it is a restricted scope requiring a security assessment).
+## Steps (one-time, by an admin)
 
-## 1. Project & API
+1. https://console.cloud.google.com → create a project, e.g. `SnapShare`.
+2. **APIs & Services → Library** → enable **Google Drive API**.
+3. **Google Auth Platform → Branding**: app name `SnapShare`, user support email, developer contact email.
+4. **Audience**: choose **External**. While the app is in **Testing**, add each colleague's Gmail address under **Test users** (up to 100). Only test users can sign in.
+5. **Data access** → Add scopes: `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `openid`, `.../auth/drive.file`. `drive.file` is non-sensitive, so no security assessment is needed.
+6. **Clients → Create client** → Application type **Chrome Extension** → Item ID `lepgoibhofiiheidakffpgglelpajjfp` → Create. Copy the **Client ID** (`…apps.googleusercontent.com`). A Chrome Extension client has no client secret.
+7. In the project create `extension/.env`:
+   ```
+   VITE_GOOGLE_CLIENT_ID=<the client ID from step 6>
+   ```
+8. Rebuild and package: `npm run build && npm run package:extension`. Give users the ZIP (see INSTALLATION.md).
 
-1. https://console.cloud.google.com → create project "SnapShare".
-2. APIs & Services → Library → enable **Google Drive API**.
+## Testing vs. In production
 
-## 2. OAuth consent screen (Google Auth Platform)
+- **Testing** (recommended for 10–20 internal users): works immediately for the listed test users. Google shows an "unverified app" screen; users click **Continue**. In Testing mode Google may require users to sign in again periodically.
+- **In production**: removes the test-user limit. Google asks for brand verification (homepage and privacy policy URL) before the unverified screen goes away. This is not needed for internal use.
 
-1. Audience: **External**.
-2. App information: name "SnapShare", support email, logo (120×120, must match the store listing), app home page `https://YOUR-DOMAIN`, privacy policy `https://YOUR-DOMAIN/privacy`, terms `https://YOUR-DOMAIN/terms`.
-3. Authorized domains: `YOUR-DOMAIN` (must be verified in Google Search Console).
-4. Data access → add scopes: `openid`, `.../auth/userinfo.email`, `.../auth/userinfo.profile`, `.../auth/drive.file`.
-5. While **Testing**: add test users (only they can sign in). Note: in Testing mode Google expires refresh tokens after **7 days** — users will be asked to sign in again; this goes away once published.
+## What the scopes allow
 
-## 3. OAuth client
+`drive.file` lets SnapShare see, create, rename, delete and share **only files and folders that SnapShare created** in the user's Drive. It cannot read any other Drive content. Sharing is always applied to a single file ID. SnapShare never adds permissions to the `SnapShare`, `Screenshots` or `Videos` folders.
 
-Credentials → Create credentials → OAuth client ID → **Web application** (not "Chrome extension": the backend does the code exchange so the client secret and refresh token never reach the browser).
+## Sign-in behaviour
 
-- Authorized redirect URIs:
-  - `http://localhost:3000/api/auth/google/callback` (development)
-  - `https://YOUR-DOMAIN/api/auth/google/callback` (production)
-- Authorized JavaScript origins: not required (no browser-side Google JS).
+- `chrome.identity.getAuthToken` uses the Google account the **Chrome profile** is signed into. To use a different Gmail account, use a different Chrome profile (each profile has separate SnapShare data).
+- Expired tokens are refreshed automatically (on a 401 the cached token is dropped and re-requested).
+- Sign-out removes the cached token, revokes it at Google, and clears the stored account.
+- If the user unticks the Drive permission on Google's consent screen, SnapShare shows "SnapShare needs the Google Drive permission" and asks them to sign in again.
 
-Copy the client ID/secret into `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` (web env only).
+## Troubleshooting
 
-The extension's own redirect (`https://<extension-id>.chromiumapp.org/auth`) is **not** registered with Google — it's validated by the backend against `ALLOWED_EXTENSION_IDS`.
-
-## 4. Flow summary
-
-1. Extension → `GET /api/auth/google/start?redirect_uri=https://<id>.chromiumapp.org/auth&state=…&code_challenge=…` (via `chrome.identity.launchWebAuthFlow`).
-2. Backend validates the extension redirect, signs a 10-minute flow-state JWT, redirects to Google with `access_type=offline`, `prompt=consent`.
-3. Google → `/api/auth/google/callback`: backend exchanges the code, verifies the ID token (signature/issuer/audience), checks `drive.file` was granted (granular consent can untick it → error `drive_permission_required`), stores the refresh token AES-256-GCM encrypted, issues a 2-minute one-time code.
-4. Backend redirects to the extension redirect with `code` + original `state`; the extension checks `state`, then `POST /api/auth/exchange` with the PKCE verifier → SnapShare session (30 days, revocable server-side).
-5. For uploads, the extension calls `POST /api/auth/drive-token` to get a ~1 h Drive access token (owner only, never stored in the database).
-
-## 5. Verification for production
-
-Because only non-sensitive scopes are used, Google requires **brand verification** (not a security assessment) before the app can be published to all users:
-
-- Verified domain ownership, home page that explains the app, privacy policy link on the home page.
-- Privacy policy must describe Google user data use and the Limited Use statement (draft provided at `/privacy`; have it reviewed).
-- Consent-screen logo/name match the Chrome Web Store listing.
-- If Google later classifies any scope as sensitive, you'll need a demo video showing the OAuth flow and each scope's use.
-
-Submit via Google Auth Platform → Verification Center → "Prepare for verification", then **Publish app** (Audience → In production).
+| Message | Fix |
+| --- | --- |
+| "Google sign-in is not configured" | `VITE_GOOGLE_CLIENT_ID` was empty at build time → set it and rebuild. |
+| `bad client id` / "OAuth client is misconfigured" | The client's Item ID must be exactly `lepgoibhofiiheidakffpgglelpajjfp`; the client type must be Chrome Extension. |
+| "Access blocked: app has not completed verification" | Add the user's Gmail as a Test user (Audience page). |
+| `Drive API has not been used in project` | Enable Google Drive API (step 2). |

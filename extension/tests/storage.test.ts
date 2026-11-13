@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { appendChunk, deleteCapture, deleteChunks, getCapture, getChunks, getDraft, listCaptures, listChunkRecordingIds, putCapture, saveDraft, updateCapture, type CaptureRecord } from '@/services/db';
 import { buildFilename, safeSubfolder } from '@/services/settings';
 import { mergeItems } from '@/features/gallery/galleryApi';
-import type { MediaAsset } from '@snapshare/shared';
+
 
 const rec = (id: string, createdAt: number, extra: Partial<CaptureRecord> = {}): CaptureRecord => ({
   id,
@@ -67,21 +67,22 @@ describe('settings helpers', () => {
   });
 });
 
-describe('gallery merging', () => {
-  const asset = (id: string, mediaType: MediaAsset['mediaType'], filename: string, createdAt: string): MediaAsset => ({
-    id, driveFileId: `d${id}`, filename, mediaType, mimeType: mediaType === 'video' ? 'video/webm' : 'image/png', size: 1, width: null, height: null, durationMs: null, parentAssetId: null, status: 'available', isDrivePublic: false, createdAt, updatedAt: createdAt,
-  });
-  it('filters by category and search and hides local copies that were uploaded', () => {
-    const assets = [asset('1', 'video', 'Demo recording', '2026-01-03T00:00:00Z'), asset('2', 'screenshot', 'Bug report', '2026-01-02T00:00:00Z')];
+describe('gallery merging (per account)', () => {
+  const file = (id: string, mediaType: string, name: string, createdTime: string) => ({ id, name, mimeType: mediaType === 'video' ? 'video/webm' : 'image/png', size: '1', createdTime, appProperties: { snapshare: '1', mediaType } });
+  it('filters by category/search, hides other accounts uploads and flags files deleted in Drive', () => {
+    const files = [file('d1', 'video', 'Demo recording', '2026-01-03T00:00:00Z'), file('d2', 'edited', 'Bug report', '2026-01-02T00:00:00Z')];
     const local = [
       { ...rec('l1', Date.parse('2026-01-04T00:00:00Z')), filename: 'Local bug' },
-      { ...rec('l2', 1), cloud: { assetId: '2', driveFileId: 'd2', uploadedAt: 1 } },
+      { ...rec('l2', 1), cloud: { assetId: 'd2', driveFileId: 'd2', uploadedAt: 1, accountId: 'A' } }, // shown via Drive item
+      { ...rec('l3', 2), cloud: { assetId: 'gone', driveFileId: 'gone', uploadedAt: 1, accountId: 'A' } }, // deleted in Drive
+      { ...rec('l4', 3), cloud: { assetId: 'x', driveFileId: 'x', uploadedAt: 1, accountId: 'B' } }, // other account
     ];
-    const all = mergeItems(assets, local, 'all', '', 'all');
-    expect(all.map((i) => i.key)).toEqual(['l:l1', 'c:1', 'c:2']);
-    expect(mergeItems(assets, local, 'video', '', 'all').map((i) => i.id)).toEqual(['1']);
-    expect(mergeItems(assets, local, 'all', 'BUG', 'all').map((i) => i.id)).toEqual(['l1', '2']);
-    expect(mergeItems(assets, local, 'all', '', 'cloud')).toHaveLength(2);
-    expect(mergeItems(assets, local, 'all', '', 'local')).toHaveLength(1);
+    const all = mergeItems(files, local, 'all', '', 'all', 'A');
+    expect(all.map((i) => i.key)).toEqual(['l:l1', 'c:d1', 'c:d2', 'l:l3']);
+    expect(all.find((i) => i.id === 'l3')!.status).toBe('missing');
+    expect(all.find((i) => i.id === 'd2')!.mediaType).toBe('edited');
+    expect(mergeItems(files, local, 'video', '', 'all', 'A').map((i) => i.id)).toEqual(['d1']);
+    expect(mergeItems(files, local, 'all', 'BUG', 'all', 'A').map((i) => i.id)).toEqual(['l1', 'd2']);
+    expect(mergeItems(files, local, 'all', '', 'local', 'B').map((i) => i.id)).toEqual(['l1', 'l4']);
   });
 });

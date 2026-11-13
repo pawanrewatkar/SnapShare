@@ -62,15 +62,27 @@ async function saveScreenshot(blob: Blob, width: number, height: number, tab: Ta
   return id;
 }
 
-/** Optional auto-upload (Settings). Failures are non-fatal: the capture stays on the device and can be uploaded later. */
+/**
+ * Every capture/recording is saved to the user's Drive (SnapShare/Screenshots or /Videos) automatically.
+ * Failures are non-fatal: the capture stays on this device, the badge shows "!" and the gallery offers a retry.
+ */
 export async function maybeAutoUpload(captureId: string) {
-  const settings = await getSettings();
-  if (!settings.autoUploadToDrive || !(await getSession())) return;
+  if (!(await getSession())) return;
   try {
     await uploadCapture(captureId);
+    await platform.storage.local.remove('lastAutoUploadError');
   } catch (e) {
     await platform.storage.local.set('lastAutoUploadError', { captureId, message: (e as Error).message, at: Date.now() });
+    await platform.setBadge('!', '#d97706').catch(() => undefined);
+    await chrome.action.setTitle({ title: `SnapShare — Drive upload failed: ${(e as Error).message}. Open the Gallery to retry.` }).catch(() => undefined);
   }
+}
+
+/** SnapShare can only be used after Google sign-in (captures must be saved to Drive). */
+export async function requireSignIn(): Promise<void> {
+  if (await getSession()) return;
+  await platform.openExtensionPage('settings.html?signin=1');
+  throw new Error('Please sign in with Google first — SnapShare saves your captures to your Google Drive.');
 }
 
 async function afterCapture(captureId: string) {

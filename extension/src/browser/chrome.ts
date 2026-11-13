@@ -62,8 +62,8 @@ export const chromePlatform: BrowserPlatform = {
     const tab = await chrome.tabs.update(tabId, { active: true });
     if (tab?.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
   },
-  download(url, filename, saveAs) {
-    return chrome.downloads.download({ url, filename, saveAs, conflictAction: 'uniquify' });
+  download(url, filename, saveAs, headers) {
+    return chrome.downloads.download({ url, filename, saveAs, conflictAction: 'uniquify', ...(headers ? { headers } : {}) });
   },
   getTabMediaStreamId(targetTabId) {
     return chrome.tabCapture.getMediaStreamId({ targetTabId });
@@ -92,13 +92,21 @@ export const chromePlatform: BrowserPlatform = {
     });
     return contexts.length > 0;
   },
-  async launchWebAuthFlow(url) {
-    const result = await chrome.identity.launchWebAuthFlow({ url, interactive: true });
-    if (!result) throw new Error('Sign-in was cancelled');
-    return result;
+  async getAuthToken(interactive, scopes) {
+    const r = (await chrome.identity.getAuthToken({ interactive, scopes })) as unknown as { token?: string; grantedScopes?: string[] } | string | undefined;
+    const token = typeof r === 'string' ? r : r?.token;
+    if (!token) throw new Error('No token returned');
+    return { token, grantedScopes: typeof r === 'object' && r?.grantedScopes ? r.grantedScopes : null };
   },
-  authRedirectUrl() {
-    return chrome.identity.getRedirectURL('auth');
+  async removeCachedAuthToken(token) {
+    await chrome.identity.removeCachedAuthToken({ token });
+  },
+  async clearAllCachedAuthTokens() {
+    await chrome.identity.clearAllCachedAuthTokens();
+  },
+  oauthClientId() {
+    const id = chrome.runtime.getManifest().oauth2?.client_id ?? '';
+    return id && !id.startsWith('REPLACE_') ? id : null;
   },
   async setBadge(text, color) {
     await chrome.action.setBadgeText({ text });

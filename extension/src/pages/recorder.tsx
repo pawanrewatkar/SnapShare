@@ -270,7 +270,7 @@ function VideoPreview({ id }: { id: string }) {
     const asset = await upload(rec.id);
     if (asset) {
       setRec((await getCapture(rec.id)) ?? rec);
-      if (andShare) setShare({ id: asset.id, filename: asset.filename });
+      if (andShare) setShare({ id: asset.id, filename: asset.name });
     }
   };
 
@@ -305,14 +305,14 @@ function VideoPreview({ id }: { id: string }) {
         <Button
           variant="ghost"
           onClick={() => {
-            if (!confirm('Delete this recording from this device? Files already uploaded to Drive are kept (delete them from the Gallery).')) return;
+            if (!confirm('Delete this recording from this device? Files already uploaded to Google Drive are kept (delete them from the Gallery).')) return;
             void deleteCapture(rec.id).then(() => window.close());
           }}
         >
           <IconTrash /> Delete local copy
         </Button>
       </div>
-      {share && <ShareDialog open assetId={share.id} filename={share.filename} onClose={() => setShare(null)} />}
+      {share && <ShareDialog open fileId={share.id} filename={share.filename} onClose={() => setShare(null)} />}
     </div>
   );
 }

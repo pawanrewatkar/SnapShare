@@ -1,5 +1,8 @@
 # SnapShare
 
+> **Current mode (2026-11-13): standalone extension, no backend.** Sign-in uses the Chrome Identity API (Chrome Extension OAuth client); files go directly to each user's own `My Drive/SnapShare/{Screenshots,Videos}` and sharing is per-file via Google Drive permissions. Install: [docs/INSTALLATION.md](docs/INSTALLATION.md); OAuth: [docs/GOOGLE_OAUTH_SETUP.md](docs/GOOGLE_OAUTH_SETUP.md). The `web/` + `supabase/` backend (branded links) is **optional/legacy** and no longer used by the extension; `npm run build` builds only the extension (`npm run build:all` includes web). Sections below that mention the backend apply only to that optional part.
+
+
 Chrome extension for screenshots (visible, region, full page, screen/window), annotation, tab/screen recording and sharing — with media stored in **each user's own Google Drive** and a Next.js website for branded share links.
 
 ```

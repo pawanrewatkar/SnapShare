@@ -8,6 +8,8 @@ export interface CloudLink {
   assetId: string;
   driveFileId: string;
   uploadedAt: number;
+  /** Google account (sub) that owns the Drive copy — keeps accounts isolated. */
+  accountId?: string;
 }
 
 export interface CaptureRecord {
@@ -49,6 +51,7 @@ export interface UploadSession {
   captureId: string;
   sessionUrl: string;
   createdAt: number;
+  accountId?: string;
 }
 
 const DB_NAME = 'snapshare';

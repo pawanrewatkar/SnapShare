@@ -5,7 +5,7 @@ import { Button, Logo, Spinner, useToast } from '@/components/ui';
 import { useSession, useSettings } from '@/hooks';
 import { signIn, signOut } from '@/features/authentication/auth';
 import { ensureFolders, getStorageQuota } from '@/features/drive/driveService';
-import { API_BASE, friendlyError } from '@/services/api';
+import { friendlyError } from '@/services/api';
 import { buildFilename, DEFAULT_SETTINGS } from '@/services/settings';
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -81,6 +81,12 @@ function SettingsPage() {
         </a>
       </header>
 
+      {!loading && !session && (
+        <div className="rounded-xl border border-brand-500 bg-brand-50 p-4 text-sm text-slate-800 dark:bg-slate-900 dark:text-slate-100">
+          <b>Welcome to SnapShare.</b> Sign in with your Google account to start. Your captures are saved to <b>My Drive/SnapShare/Screenshots</b> and{' '}
+          <b>My Drive/SnapShare/Videos</b>.
+        </div>
+      )}
       <Section title="Google account">
         {loading ? (
           <Spinner />
@@ -90,7 +96,7 @@ function SettingsPage() {
             <div>
               <p className="font-medium">{session.user.name}</p>
               <p className="text-xs text-slate-500">{session.user.email}</p>
-              <p className="text-xs text-slate-500">Session valid until {new Date(session.expiresAt).toLocaleString()}</p>
+              <p className="text-xs text-slate-500">Google account used by this Chrome profile. To use another Gmail account, use a separate Chrome profile.</p>
             </div>
             <Button className="ml-auto" variant="secondary" loading={busy} onClick={() => (setBusy(true), void signOut().finally(() => setBusy(false)))}>
               Sign out
@@ -113,7 +119,7 @@ function SettingsPage() {
       <Section title="Google Drive">
         <Row label="Connection">
           <span className={driveState === 'connected' ? 'text-emerald-600' : driveState === 'error' ? 'text-red-600' : 'text-slate-500'}>
-            {!session ? 'Not connected' : driveState === 'checking' ? 'Checking…' : driveState === 'connected' ? 'Connected · folder SnapShare/ ready' : driveError}
+            {!session ? 'Not connected' : driveState === 'checking' ? 'Checking…' : driveState === 'connected' ? 'Connected · My Drive/SnapShare/Screenshots and /Videos ready' : driveError}
           </span>
         </Row>
         {quota && (
@@ -123,9 +129,7 @@ function SettingsPage() {
             </span>
           </Row>
         )}
-        <Row label="Upload automatically after capture" hint="Otherwise upload from the editor, preview or gallery.">
-          <input type="checkbox" checked={settings.autoUploadToDrive} onChange={(e) => void save({ autoUploadToDrive: e.target.checked })} />
-        </Row>
+        <p className="text-xs text-slate-500">Every screenshot, edited image and recording is saved to your Drive automatically after capture.</p>
         <p className="text-xs text-slate-500">Automatically uploaded files are private in your Drive; nothing is shared until you create a link.</p>
       </Section>
 
@@ -169,29 +173,9 @@ function SettingsPage() {
       </Section>
 
       <Section title="Privacy & sharing">
-        <Row label="Default link type" hint="Restricted links keep the Drive file private.">
-          <select className={input} value={settings.defaultShareAccess} onChange={(e) => void save({ defaultShareAccess: e.target.value as 'restricted' | 'public' })}>
-            <option value="restricted">Restricted</option>
-            <option value="public">Public (asks for confirmation each time)</option>
-          </select>
-        </Row>
-        <Row label="Default link expiry">
-          <select className={input} value={settings.defaultShareExpiryDays} onChange={(e) => void save({ defaultShareExpiryDays: Number(e.target.value) })}>
-            <option value={1}>1 day</option>
-            <option value={7}>7 days</option>
-            <option value={30}>30 days</option>
-            <option value={0}>Never</option>
-          </select>
-        </Row>
-        <Row label="Allow recipients to download">
-          <input type="checkbox" checked={settings.shareAllowDownload} onChange={(e) => void save({ shareAllowDownload: e.target.checked })} />
-        </Row>
         <p className="text-xs text-slate-500">
-          Uploaded files are always private by default. Nothing is made public unless you explicitly choose to. Read the{' '}
-          <a className="underline" href={`${API_BASE}/privacy`} target="_blank" rel="noreferrer">
-            privacy policy
-          </a>
-          .
+          Uploads are private in your own Google Drive. Sharing always applies to a single file (specific Gmail addresses, or “anyone with the link” after confirmation) — SnapShare never
+          shares your SnapShare, Screenshots or Videos folders. Use Share in the gallery or editor to see and revoke access.
         </p>
       </Section>
     </div>

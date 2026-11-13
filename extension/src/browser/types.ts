@@ -26,13 +26,15 @@ export interface BrowserPlatform {
   extensionUrl(path: string): string;
   closeTab(tabId: number): Promise<void>;
   focusTab(tabId: number): Promise<void>;
-  download(url: string, filename: string, saveAs: boolean): Promise<number>;
+  download(url: string, filename: string, saveAs: boolean, headers?: { name: string; value: string }[]): Promise<number>;
   getTabMediaStreamId(targetTabId: number): Promise<string>;
   ensureOffscreen(path: string, reasons: string[], justification: string): Promise<void>;
   closeOffscreen(): Promise<void>;
   hasOffscreen(path: string): Promise<boolean>;
-  launchWebAuthFlow(url: string): Promise<string>;
-  authRedirectUrl(): string;
+  getAuthToken(interactive: boolean, scopes: string[]): Promise<{ token: string; grantedScopes: string[] | null }>;
+  removeCachedAuthToken(token: string): Promise<void>;
+  clearAllCachedAuthTokens(): Promise<void>;
+  oauthClientId(): string | null;
   setBadge(text: string, color?: string): Promise<void>;
   storage: { local: KeyValueArea; session: KeyValueArea; sync: KeyValueArea };
 }

@@ -1,73 +1,59 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { DrivePermission, ShareAccessType, ShareLink } from '@snapshare/shared';
 import { Button, Modal, Spinner, useToast } from '@/components/ui';
-import { api, friendlyError } from '@/services/api';
+import { friendlyError } from '@/services/api';
 import { copyText } from '@/services/media';
-import { getSettings } from '@/services/settings';
+import { drive, type DriveFile } from '@/features/drive/driveApi';
+import { cachedFolders, ensureFolders, FOLDER_NAMES } from '@/features/drive/driveService';
+import { analyzeSharing, fileUrl, isValidEmail, type FolderPermissions, type SharingState } from './permissions';
 
-interface PermissionsResponse {
-  permissions: DrivePermission[];
-  webViewLink: string | null;
+/** Loads the file's own permissions plus those of its SnapShare parent folders (inheritance check). */
+export async function loadSharing(fileId: string): Promise<{ file: DriveFile; state: SharingState; folders: FolderPermissions[] }> {
+  const file = await drive.getFile(fileId, 'id,name,mimeType,parents,webViewLink');
+  const f = (await cachedFolders()) ?? (await ensureFolders());
+  const names: Record<string, string> = { [f.root]: FOLDER_NAMES.root, [f.screenshots]: `${FOLDER_NAMES.root}/${FOLDER_NAMES.screenshots}`, [f.videos]: `${FOLDER_NAMES.root}/${FOLDER_NAMES.videos}` };
+  const folderIds = [...new Set([...(file.parents ?? []), f.root])];
+  const folders = await Promise.all(
+    folderIds.map(async (id) => ({ folderId: id, folderName: names[id] ?? 'parent folder', permissions: await drive.listPermissions(id).catch(() => []) })),
+  );
+  const state = analyzeSharing(await drive.listPermissions(fileId), folders);
+  return { file, state, folders };
 }
 
-export const listShares = (assetId: string) => api<ShareLink[]>(`/api/assets/${assetId}/shares`);
-export const createShare = (assetId: string, body: { accessType: ShareAccessType; expiresInDays: number | null; allowDownload: boolean }) =>
-  api<ShareLink>(`/api/assets/${assetId}/shares`, { body });
-export const revokeShare = (shareId: string) => api<void>(`/api/shares/${shareId}`, { method: 'DELETE' });
-
-/** Returns the URL of an active share link, creating a private (restricted) one with user defaults if none exists. */
-export async function getOrCreateShareUrl(assetId: string): Promise<string> {
-  const existing = (await listShares(assetId)).find((s) => s.isActive && s.url && (!s.expiresAt || new Date(s.expiresAt) > new Date()));
-  if (existing?.url) return existing.url;
-  const st = await getSettings();
-  const created = await createShare(assetId, { accessType: 'restricted', expiresInDays: st.defaultShareExpiryDays || null, allowDownload: st.shareAllowDownload });
-  return created.url!;
+/** Copies the original Drive URL of the single file (creates no permission). */
+export async function copyDriveFileLink(fileId: string): Promise<string> {
+  const file = await drive.getFile(fileId, 'id,webViewLink');
+  const url = fileUrl(file.id, file.webViewLink);
+  await copyText(url);
+  return url;
 }
 
-function describeExpiry(s: ShareLink) {
-  if (!s.isActive) return 'Revoked';
-  if (!s.expiresAt) return 'Never expires';
-  const d = new Date(s.expiresAt);
-  return d < new Date() ? `Expired ${d.toLocaleDateString()}` : `Expires ${d.toLocaleString()}`;
-}
-
-export function ShareDialog({ assetId, filename, open, onClose }: { assetId: string; filename: string; open: boolean; onClose: () => void }) {
+export function ShareDialog({ fileId, filename, open, onClose }: { fileId: string; filename: string; open: boolean; onClose: () => void }) {
   const toast = useToast();
-  const [shares, setShares] = useState<ShareLink[] | null>(null);
-  const [perms, setPerms] = useState<PermissionsResponse | null>(null);
+  const [data, setData] = useState<Awaited<ReturnType<typeof loadSharing>> | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [access, setAccess] = useState<ShareAccessType>('restricted');
-  const [expiry, setExpiry] = useState<number>(7);
-  const [allowDownload, setAllowDownload] = useState(true);
-  const [confirmPublic, setConfirmPublic] = useState(false);
-  const [confirmDrivePublic, setConfirmDrivePublic] = useState(false);
+  const [confirmAnyone, setConfirmAnyone] = useState(false);
   const [email, setEmail] = useState('');
-  const [notify, setNotify] = useState(false);
+  const [notify, setNotify] = useState(true);
 
   const load = useCallback(async () => {
     try {
-      const [s, p] = await Promise.all([listShares(assetId), api<PermissionsResponse>(`/api/assets/${assetId}/permissions`)]);
-      setShares(s);
-      setPerms(p);
+      setError(null);
+      setData(await loadSharing(fileId));
     } catch (e) {
-      toast('error', friendlyError(e));
+      setError(friendlyError(e));
     }
-  }, [assetId, toast]);
+  }, [fileId]);
 
   useEffect(() => {
-    if (!open) return;
-    void load();
-    void getSettings().then((s) => {
-      setAccess(s.defaultShareAccess);
-      setExpiry(s.defaultShareExpiryDays);
-      setAllowDownload(s.shareAllowDownload);
-    });
+    if (open) void load();
   }, [open, load]);
 
-  const run = async (key: string, fn: () => Promise<void>) => {
-    setBusy(key);
+  const run = async (k: string, fn: () => Promise<void>) => {
+    setBusy(k);
     try {
       await fn();
+      await load();
     } catch (e) {
       toast('error', friendlyError(e));
     } finally {
@@ -75,173 +61,148 @@ export function ShareDialog({ assetId, filename, open, onClose }: { assetId: str
     }
   };
 
-  const anyone = perms?.permissions.find((p) => p.type === 'anyone');
-  const people = perms?.permissions.filter((p) => p.type === 'user' && p.role !== 'owner') ?? [];
+  const url = data ? fileUrl(data.file.id, data.file.webViewLink) : '';
+  const st = data?.state;
+  const anyoneDirect = st?.direct.find((p) => p.type === 'anyone');
 
   return (
     <Modal open={open} title={`Share “${filename}”`} onClose={onClose} wide>
-      {!shares || !perms ? (
+      {error ? (
+        <p className="text-sm text-red-600">{error}</p>
+      ) : !data || !st ? (
         <div className="flex justify-center p-8">
           <Spinner />
         </div>
       ) : (
-        <div className="space-y-6 text-sm">
-          <section>
-            <h3 className="mb-1 font-semibold">SnapShare link</h3>
-            <p className="mb-3 text-xs text-slate-500">
-              Recipients open the file on the SnapShare website without installing anything. <b>Restricted</b> links keep the Drive file private — SnapShare checks the secret link,
-              expiry and revocation before streaming the file. Anyone who has a restricted link can view it, so share it only with intended people.
-            </p>
-            <ul className="mb-3 space-y-2">
-              {shares.length === 0 && <li className="text-xs text-slate-500">No links yet.</li>}
-              {shares.map((s) => (
-                <li key={s.id} className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 p-2 dark:border-slate-700">
-                  <span className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${s.accessType === 'public' ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'}`}>
-                    {s.accessType === 'public' ? 'Public' : 'Restricted'}
-                  </span>
-                  <span className="text-xs text-slate-500">{describeExpiry(s)}</span>
-                  <span className="text-xs text-slate-500">{s.allowDownload ? 'Download allowed' : 'View only'}</span>
-                  <span className="ml-auto flex gap-1">
-                    {s.isActive && s.url && (
-                      <Button size="sm" onClick={() => void copyText(s.url!).then(() => toast('success', 'Link copied'), (e) => toast('error', friendlyError(e)))}>
-                        Copy
-                      </Button>
-                    )}
-                    {s.isActive && (
-                      <Button size="sm" variant="danger" loading={busy === `revoke-${s.id}`} onClick={() => void run(`revoke-${s.id}`, async () => (await revokeShare(s.id), await load(), toast('success', 'Link revoked')))}>
-                        Revoke
-                      </Button>
-                    )}
-                  </span>
-                </li>
-              ))}
-            </ul>
-            <div className="grid gap-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-800/50 sm:grid-cols-3">
-              <label className="flex flex-col gap-1 text-xs">
-                Access
-                <select value={access} onChange={(e) => (setAccess(e.target.value as ShareAccessType), setConfirmPublic(false))} className="rounded border border-slate-300 bg-white p-1.5 dark:border-slate-600 dark:bg-slate-900">
-                  <option value="restricted">Restricted (Drive file stays private)</option>
-                  <option value="public">Public (also public in Google Drive)</option>
-                </select>
-              </label>
-              <label className="flex flex-col gap-1 text-xs">
-                Expires
-                <select value={expiry} onChange={(e) => setExpiry(Number(e.target.value))} className="rounded border border-slate-300 bg-white p-1.5 dark:border-slate-600 dark:bg-slate-900">
-                  <option value={1}>in 1 day</option>
-                  <option value={7}>in 7 days</option>
-                  <option value={30}>in 30 days</option>
-                  <option value={0}>never</option>
-                </select>
-              </label>
-              <label className="flex items-end gap-2 pb-1.5 text-xs">
-                <input type="checkbox" checked={allowDownload} onChange={(e) => setAllowDownload(e.target.checked)} /> Allow download
-              </label>
-              {access === 'public' && (
-                <label className="flex items-start gap-2 rounded bg-amber-50 p-2 text-xs text-amber-900 sm:col-span-3 dark:bg-amber-950 dark:text-amber-200">
-                  <input type="checkbox" checked={confirmPublic} onChange={(e) => setConfirmPublic(e.target.checked)} className="mt-0.5" />
-                  I understand this changes the Google Drive permission so that <b>anyone with the link can view this file</b>, even after the SnapShare link expires, until I revoke it.
-                </label>
-              )}
-              <div className="sm:col-span-3">
-                <Button
-                  variant="primary"
-                  disabled={access === 'public' && !confirmPublic}
-                  loading={busy === 'create'}
-                  onClick={() =>
-                    void run('create', async () => {
-                      const s = await createShare(assetId, { accessType: access, expiresInDays: expiry || null, allowDownload });
-                      if (s.url) await copyText(s.url).catch(() => undefined);
-                      toast('success', 'Link created and copied');
-                      setConfirmPublic(false);
-                      await load();
-                    })
-                  }
-                >
-                  Create link
-                </Button>
-              </div>
-            </div>
+        <div className="space-y-5 text-sm">
+          <p className="text-xs text-slate-500">
+            Sharing applies to <b>this file only</b>. SnapShare never shares your SnapShare, Screenshots or Videos folders, and recipients cannot browse your other files.
+          </p>
+
+          <section className={`rounded-lg p-3 ${st.isPrivate ? 'bg-emerald-50 text-emerald-900 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-amber-50 text-amber-900 dark:bg-amber-950 dark:text-amber-200'}`}>
+            <p className="font-medium">Current access: {st.summary}</p>
           </section>
 
+          {st.inherited.length > 0 && (
+            <section className="rounded-lg border border-red-300 bg-red-50 p-3 text-red-900 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+              <p className="font-semibold">Warning: a parent folder is shared</p>
+              <p className="mt-1 text-xs">
+                Because these folder permissions are inherited, this file — and <b>every other file in that folder</b> — is accessible to the people below, even if you remove sharing from
+                this file. Remove the folder sharing to keep your other files private.
+              </p>
+              <ul className="mt-2 space-y-1">
+                {st.inherited.map((p) => (
+                  <li key={`${p.folderId}-${p.id}`} className="flex items-center justify-between gap-2 text-xs">
+                    <span>
+                      {p.type === 'anyone' ? 'Anyone with the link' : (p.emailAddress ?? p.domain ?? p.displayName)} ({p.role}) via <b>{p.folderName}</b>
+                    </span>
+                    <Button size="sm" variant="danger" loading={busy === `fold-${p.folderId}-${p.id}`} onClick={() => void run(`fold-${p.folderId}-${p.id}`, () => drive.deletePermission(p.folderId, p.id).then(() => toast('success', 'Folder sharing removed')))}>
+                      Remove from folder
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           <section>
-            <h3 className="mb-1 font-semibold">Google Drive sharing</h3>
-            <p className="mb-2 text-xs text-slate-500">
-              Current state:{' '}
-              <b>{anyone ? 'Anyone with the Drive link can view' : people.length ? `Private · shared with ${people.length} ${people.length === 1 ? 'person' : 'people'}` : 'Private (only you)'}</b>
-            </p>
-            <div className="mb-3 flex flex-wrap gap-2">
-              {anyone ? (
-                <>
-                  <Button size="sm" onClick={() => perms.webViewLink && void copyText(perms.webViewLink).then(() => toast('success', 'Drive link copied'))}>
-                    Copy Drive link
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="danger"
-                    loading={busy === 'drive-private'}
-                    onClick={() => void run('drive-private', async () => (await api(`/api/assets/${assetId}/permissions/${anyone.id}`, { method: 'DELETE' }), await load(), toast('success', 'Public Drive access removed')))}
-                  >
-                    Make private in Drive
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <label className="flex items-start gap-2 text-xs">
-                    <input type="checkbox" checked={confirmDrivePublic} onChange={(e) => setConfirmDrivePublic(e.target.checked)} className="mt-0.5" />
-                    Allow anyone with the Google Drive link to view this file
-                  </label>
-                  <Button
-                    size="sm"
-                    disabled={!confirmDrivePublic}
-                    loading={busy === 'drive-public'}
-                    onClick={() =>
-                      void run('drive-public', async () => {
-                        const res = await api<PermissionsResponse>(`/api/assets/${assetId}/permissions`, { body: { type: 'anyone' } });
-                        setPerms(res);
-                        setConfirmDrivePublic(false);
-                        if (res.webViewLink) await copyText(res.webViewLink).catch(() => undefined);
-                        toast('success', 'Drive link enabled and copied');
-                      })
-                    }
-                  >
-                    Generate Drive link
-                  </Button>
-                </>
-              )}
-            </div>
-            <p className="mb-1 text-xs font-medium">Share with specific Google accounts (Google verifies their identity)</p>
+            <h3 className="mb-1 font-semibold">Share with specific Gmail addresses</h3>
             <form
-              className="mb-2 flex flex-wrap gap-2"
+              className="flex flex-wrap items-center gap-2"
               onSubmit={(e) => {
                 e.preventDefault();
-                void run('add-user', async () => {
-                  const res = await api<PermissionsResponse>(`/api/assets/${assetId}/permissions`, { body: { type: 'user', email, notify } });
-                  setPerms(res);
+                const addr = email.trim();
+                if (!isValidEmail(addr)) return toast('error', 'Enter a valid email address');
+                void run('add', async () => {
+                  await drive.createPermission(fileId, { type: 'user', emailAddress: addr }, notify);
+                  await copyText(url).catch(() => undefined);
                   setEmail('');
-                  toast('success', `Shared with ${email}`);
+                  toast('success', `Shared with ${addr} (viewer). Link copied.`);
                 });
               }}
             >
-              <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" className="min-w-0 flex-1 rounded border border-slate-300 bg-white p-1.5 dark:border-slate-600 dark:bg-slate-900" />
+              <input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@gmail.com" className="min-w-0 flex-1 rounded border border-slate-300 bg-white p-1.5 dark:border-slate-600 dark:bg-slate-900" />
               <label className="flex items-center gap-1 text-xs">
-                <input type="checkbox" checked={notify} onChange={(e) => setNotify(e.target.checked)} /> Email them
+                <input type="checkbox" checked={notify} onChange={(e) => setNotify(e.target.checked)} /> Notify by email
               </label>
-              <Button size="sm" type="submit" loading={busy === 'add-user'}>
-                Add viewer
+              <Button size="sm" variant="primary" type="submit" loading={busy === 'add'}>
+                Share (viewer)
               </Button>
             </form>
-            <ul className="space-y-1">
-              {people.map((p) => (
-                <li key={p.id} className="flex items-center justify-between rounded border border-slate-200 px-2 py-1 text-xs dark:border-slate-700">
-                  <span>
-                    {p.displayName ?? p.emailAddress} <span className="text-slate-500">({p.role})</span>
-                  </span>
-                  <Button size="sm" variant="ghost" loading={busy === `rm-${p.id}`} onClick={() => void run(`rm-${p.id}`, async () => (await api(`/api/assets/${assetId}/permissions/${p.id}`, { method: 'DELETE' }), await load()))}>
-                    Remove
-                  </Button>
-                </li>
-              ))}
+            <ul className="mt-2 space-y-1">
+              {st.direct
+                .filter((p) => p.type !== 'anyone')
+                .map((p) => (
+                  <li key={p.id} className="flex items-center justify-between rounded border border-slate-200 px-2 py-1 text-xs dark:border-slate-700">
+                    <span>
+                      {p.emailAddress ?? p.domain ?? p.displayName} <span className="text-slate-500">({p.role})</span>
+                    </span>
+                    <Button size="sm" variant="ghost" loading={busy === `rm-${p.id}`} onClick={() => void run(`rm-${p.id}`, () => drive.deletePermission(fileId, p.id).then(() => toast('success', 'Access removed')))}>
+                      Remove
+                    </Button>
+                  </li>
+                ))}
             </ul>
+          </section>
+
+          <section>
+            <h3 className="mb-1 font-semibold">Anyone with the link</h3>
+            {anyoneDirect ? (
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs">Anyone who has the link can <b>view</b> this file.</span>
+                <Button size="sm" variant="danger" loading={busy === 'anyone-off'} onClick={() => void run('anyone-off', () => drive.deletePermission(fileId, anyoneDirect.id).then(() => toast('success', 'Link access turned off')))}>
+                  Turn off link access
+                </Button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label className="flex items-start gap-2 text-xs">
+                  <input type="checkbox" checked={confirmAnyone} onChange={(e) => setConfirmAnyone(e.target.checked)} className="mt-0.5" />
+                  <span>
+                    I understand that <b>anyone who gets this link</b> (including people I forward it to) can view this one file without signing in. My other files and folders stay private.
+                  </span>
+                </label>
+                <Button
+                  size="sm"
+                  disabled={!confirmAnyone}
+                  loading={busy === 'anyone-on'}
+                  onClick={() =>
+                    void run('anyone-on', async () => {
+                      await drive.createPermission(fileId, { type: 'anyone' });
+                      await copyText(url).catch(() => undefined);
+                      setConfirmAnyone(false);
+                      toast('success', 'Anyone with the link can view. Link copied.');
+                    })
+                  }
+                >
+                  Enable link access (viewer)
+                </Button>
+              </div>
+            )}
+          </section>
+
+          <section className="flex flex-wrap items-center gap-2 border-t border-slate-200 pt-4 dark:border-slate-700">
+            <code className="min-w-0 flex-1 truncate rounded bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800" title={url}>
+              {url}
+            </code>
+            <Button size="sm" onClick={() => void copyText(url).then(() => toast('success', st.isPrivate ? 'Link copied — the file is still private; only you can open it.' : 'Link copied'))}>
+              Copy Drive link
+            </Button>
+            {st.direct.length > 0 && (
+              <Button
+                size="sm"
+                variant="danger"
+                loading={busy === 'revoke-all'}
+                onClick={() =>
+                  void run('revoke-all', async () => {
+                    for (const p of st.direct) await drive.deletePermission(fileId, p.id);
+                    toast('success', st.inherited.length ? 'Direct sharing removed. Folder sharing still applies — see warning.' : 'Sharing revoked. The file is private.');
+                  })
+                }
+              >
+                Revoke all sharing for this file
+              </Button>
+            )}
           </section>
         </div>
       )}

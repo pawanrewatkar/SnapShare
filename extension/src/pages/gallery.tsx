@@ -3,15 +3,16 @@ import { formatBytes, formatDuration } from '@snapshare/shared';
 import { mount } from './mount';
 import { Button, EmptyState, Logo, Modal, ProgressBar, Spinner, useToast } from '@/components/ui';
 import * as I from '@/components/icons';
-import { apiBlobUrl, friendlyError } from '@/services/api';
+import { friendlyError } from '@/services/api';
 import { deleteCapture, getCapture, listCaptures, updateCapture, type CaptureMeta } from '@/services/db';
-import { copyImageToClipboard, copyText, downloadBlob } from '@/services/media';
+import { copyImageToClipboard, downloadBlob } from '@/services/media';
 import { platform } from '@/browser';
 import { useSession } from '@/hooks';
 import { useUpload } from '@/features/drive/useUpload';
-import { ShareDialog, getOrCreateShareUrl } from '@/features/sharing/ShareDialog';
-import { deleteAsset, listAssets, mergeItems, reconcileAssets, renameAsset, signedContentUrl, type Category, type GalleryItem } from '@/features/gallery/galleryApi';
-import type { MediaAsset } from '@snapshare/shared';
+import { ShareDialog, copyDriveFileLink } from '@/features/sharing/ShareDialog';
+import { listDriveFiles, mergeItems, type Category, type GalleryItem } from '@/features/gallery/galleryApi';
+import { drive, type DriveFile } from '@/features/drive/driveApi';
+import { getAccessToken } from '@/features/authentication/auth';
 
 const CATEGORIES: { id: Category; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -26,7 +27,7 @@ function Thumbnail({ item }: { item: GalleryItem }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   useEffect(() => {
-    if (item.mediaType === 'video' || item.status === 'missing') return;
+    if (item.mediaType === 'video') return;
     const el = ref.current;
     if (!el) return;
     let created: string | null = null;
@@ -40,7 +41,9 @@ function Thumbnail({ item }: { item: GalleryItem }) {
           const rec = await getCapture(item.id);
           if (rec && !cancelled) created = URL.createObjectURL(rec.blob);
         } else {
-          created = await apiBlobUrl(`/api/assets/${item.id}/thumbnail`, ctrl.signal);
+          // Drive thumbnails are generated asynchronously; fall back to the (bounded) image itself.
+          const blob = (await drive.thumbnailBlob(item.file!)) ?? (item.size <= 15 * 1024 * 1024 ? await drive.downloadBlob(item.id) : null);
+          if (blob && !cancelled) created = URL.createObjectURL(blob);
         }
         if (!cancelled) setUrl(created);
       } catch {
@@ -54,12 +57,10 @@ function Thumbnail({ item }: { item: GalleryItem }) {
       obs.disconnect();
       if (created) URL.revokeObjectURL(created);
     };
-  }, [item.id, item.source, item.mediaType, item.status]);
+  }, [item.id, item.source, item.mediaType, item.status, item.file, item.size]);
   return (
     <div ref={ref} className="flex aspect-video items-center justify-center overflow-hidden bg-slate-100 dark:bg-slate-800">
-      {item.status === 'missing' ? (
-        <span className="px-2 text-center text-xs text-red-600">Missing from Google Drive</span>
-      ) : item.mediaType === 'video' ? (
+      {item.mediaType === 'video' ? (
         <I.IconVideo width={32} height={32} className="text-slate-400" />
       ) : url ? (
         <img src={url} alt="" className="h-full w-full object-cover object-top" />
@@ -84,8 +85,8 @@ function PreviewModal({ item, onClose }: { item: GalleryItem; onClose: () => voi
         created = URL.createObjectURL(rec.blob);
         setSrc(created);
       } else {
-        // Short-lived signed URL lets <video>/<img> stream directly (with HTTP range support) without exposing tokens.
-        setSrc((await signedContentUrl(item.id)).url);
+        created = URL.createObjectURL(await drive.downloadBlob(item.id));
+        setSrc(created);
       }
     })().catch((e) => setErr(friendlyError(e)));
     return () => {
@@ -105,7 +106,7 @@ function Gallery() {
   const [category, setCategory] = useState<Category>('all');
   const [source, setSource] = useState<'all' | 'cloud' | 'local'>('all');
   const [q, setQ] = useState('');
-  const [assets, setAssets] = useState<MediaAsset[]>([]);
+  const [assets, setAssets] = useState<DriveFile[]>([]);
   const [local, setLocal] = useState<CaptureMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,7 +123,7 @@ function Gallery() {
     setError(null);
     try {
       setLocal(await listCaptures());
-      if (session) setAssets(await listAssets('all', ''));
+      if (session) setAssets(await listDriveFiles());
       else setAssets([]);
     } catch (e) {
       setError(friendlyError(e));
@@ -135,29 +136,14 @@ function Gallery() {
     if (!sessionLoading) void load();
   }, [load, sessionLoading]);
 
-  const sync = useCallback(async () => {
+  // Drive is listed live on every load, so files deleted in Drive show up as "missing" automatically.
+  const sync = async () => {
     setSyncing(true);
-    try {
-      const r = await reconcileAssets();
-      if (r.missing) toast('info', `${r.missing} file(s) were deleted in Google Drive and are marked missing.`);
-      await load();
-    } catch (e) {
-      toast('error', friendlyError(e));
-    } finally {
-      setSyncing(false);
-    }
-  }, [load, toast]);
+    await load();
+    setSyncing(false);
+  };
 
-  // Reconcile with Drive once per gallery open.
-  const synced = useRef(false);
-  useEffect(() => {
-    if (session && !synced.current) {
-      synced.current = true;
-      void sync();
-    }
-  }, [session, sync]);
-
-  const items = mergeItems(assets, local, category, q, source);
+  const items = mergeItems(assets, local, category, q, source, session?.user.id ?? null);
 
   const act = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
@@ -177,8 +163,8 @@ function Gallery() {
         if (!rec) throw new Error('Not found on this device');
         await downloadBlob(rec.blob, rec.filename);
       } else {
-        const { url } = await signedContentUrl(item.id, true);
-        await platform.download(url, item.filename, false);
+        // chrome.downloads streams straight from Drive with the bearer header (no full copy in memory).
+        await platform.download(drive.mediaUrl(item.id), item.filename, false, [{ name: 'Authorization', value: `Bearer ${await getAccessToken(false)}` }]);
       }
       toast('success', 'Download started');
     });
@@ -188,9 +174,7 @@ function Gallery() {
       let blob: Blob;
       if (item.source === 'local') blob = (await getCapture(item.id))!.blob;
       else {
-        const res = await fetch((await signedContentUrl(item.id)).url);
-        if (!res.ok) throw new Error('Could not fetch the image from Drive');
-        blob = await res.blob();
+        blob = await drive.downloadBlob(item.id);
       }
       await copyImageToClipboard(blob);
       toast('success', 'Image copied to clipboard');
@@ -198,14 +182,17 @@ function Gallery() {
 
   const remove = (item: GalleryItem) =>
     act(`rm-${item.key}`, async () => {
-      if (item.source === 'local') {
+      if (item.status === 'missing') {
+        // Deleted in Drive: keep the local copy, forget the dead Drive link so it can be re-uploaded.
+        await updateCapture(item.id, { cloud: null });
+      } else if (item.source === 'local') {
         if (!confirm(`Delete “${item.filename}” from this device?`)) return;
         await deleteCapture(item.id);
       } else {
-        if (!confirm(`Permanently delete “${item.filename}” from your Google Drive? Share links to it will stop working.`)) return;
-        await deleteAsset(item.id);
+        if (!confirm(`Permanently delete “${item.filename}” from your Google Drive? Anyone it was shared with loses access.`)) return;
+        await drive.delete(item.id);
         // Unlink any local copy so it can be re-uploaded later.
-        const linked = local.find((l) => l.cloud?.assetId === item.id);
+        const linked = local.find((l) => l.cloud?.driveFileId === item.id);
         if (linked) await updateCapture(linked.id, { cloud: null });
       }
       toast('success', 'Deleted');
@@ -214,8 +201,8 @@ function Gallery() {
 
   const copyLink = (item: GalleryItem) =>
     act(`ln-${item.key}`, async () => {
-      await copyText(await getOrCreateShareUrl(item.id));
-      toast('success', 'Share link copied (restricted link — Drive file stays private)');
+      await copyDriveFileLink(item.id);
+      toast('success', 'Drive link copied. Use Share to give people access — the file stays private until you do.');
     });
 
   const uploadLocal = (item: GalleryItem) =>
@@ -229,8 +216,10 @@ function Gallery() {
     act('rename', async () => {
       const name = rename.value.trim();
       if (!name) throw new Error('Name cannot be empty');
-      if (rename.item.source === 'cloud') await renameAsset(rename.item.id, name);
-      else await updateCapture(rename.item.id, { filename: name });
+      if (rename.item.source === 'cloud') {
+        const ext = rename.item.mimeType === 'video/webm' ? '.webm' : rename.item.mimeType === 'image/jpeg' ? '.jpg' : '.png';
+        await drive.rename(rename.item.id, name.toLowerCase().endsWith(ext) ? name : `${name}${ext}`);
+      } else await updateCapture(rename.item.id, { filename: name });
       setRename(null);
       toast('success', 'Renamed');
       await load();
@@ -243,8 +232,8 @@ function Gallery() {
         <h1 className="text-lg font-semibold text-slate-500">Gallery</h1>
         <div className="ml-auto flex items-center gap-2">
           {session ? (
-            <Button size="sm" loading={syncing} onClick={() => void sync()} title="Check Google Drive for deleted files">
-              Sync with Drive
+            <Button size="sm" loading={syncing} onClick={() => void sync()} title="Reload the file list from Google Drive">
+              Refresh from Drive
             </Button>
           ) : (
             <span className="text-xs text-slate-500">Sign in from the popup or Settings to see your Google Drive files.</span>
@@ -287,7 +276,7 @@ function Gallery() {
         <ul className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {items.map((item) => (
             <li key={item.key} className={`overflow-hidden rounded-xl border bg-white shadow-sm dark:bg-slate-900 ${highlight === item.id ? 'border-brand-500 ring-2 ring-brand-500' : 'border-slate-200 dark:border-slate-800'}`}>
-              <button className="block w-full" onClick={() => item.status !== 'missing' && setPreview(item)} aria-label={`Preview ${item.filename}`}>
+              <button className="block w-full" onClick={() => setPreview(item)} aria-label={`Preview ${item.filename}`}>
                 <Thumbnail item={item} />
               </button>
               <div className="p-3">
@@ -302,20 +291,18 @@ function Gallery() {
                   <span>{new Date(item.createdAt).toLocaleString()}</span>
                 </p>
                 <p className="mt-1 text-[11px]">
-                  {item.source === 'cloud' ? (
-                    item.status === 'missing' ? (
-                      <span className="text-red-600">Deleted in Drive</span>
-                    ) : (
-                      <span className="text-emerald-600">In Google Drive{item.asset?.isDrivePublic ? ' · public link on' : ' · private'}</span>
-                    )
+                  {item.status === 'missing' ? (
+                    <span className="text-red-600">Deleted from Google Drive · local copy kept</span>
+                  ) : item.source === 'cloud' ? (
+                    <span className="text-emerald-600">In your Google Drive (open Share to see who has access)</span>
                   ) : (
                     <span className="text-slate-500">Only on this device</span>
                   )}
                 </p>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {item.status === 'missing' ? (
-                    <Button size="sm" variant="danger" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)}>
-                      Remove from list
+                    <Button size="sm" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)}>
+                      Unlink (re-upload later)
                     </Button>
                   ) : (
                     <>
@@ -362,7 +349,7 @@ function Gallery() {
       )}
 
       {preview && <PreviewModal item={preview} onClose={() => setPreview(null)} />}
-      {share && <ShareDialog open assetId={share.id} filename={share.filename} onClose={() => setShare(null)} />}
+      {share && <ShareDialog open fileId={share.id} filename={share.filename} onClose={() => setShare(null)} />}
       <Modal open={!!rename} title="Rename file" onClose={() => setRename(null)}>
         <form
           onSubmit={(e) => {

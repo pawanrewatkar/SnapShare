@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
-import type { MediaAsset } from '@snapshare/shared';
+import type { DriveFile } from './driveApi';
 import { useToast } from '@/components/ui';
 import { friendlyError } from '@/services/api';
 import { isReauthError, signIn } from '@/features/authentication/auth';
@@ -25,17 +25,18 @@ export function useUpload() {
   const ctrl = useRef<AbortController | null>(null);
 
   const upload = useCallback(
-    async (captureId: string): Promise<MediaAsset | null> => {
+    async (captureId: string): Promise<DriveFile | null> => {
       setUploading(true);
       setProgress(0);
       ctrl.current = new AbortController();
       const attempt = () => uploadCapture(captureId, (p) => setProgress(p.total ? p.sent / p.total : null), ctrl.current!.signal);
       try {
-        let asset: MediaAsset;
+        let asset: DriveFile;
         try {
           asset = await attempt();
         } catch (e) {
           if (!isReauthError(e) && !(e instanceof DriveError && e.code === 'auth')) throw e;
+          if ((e as { code?: string }).code === 'not_configured') throw e;
           toast('info', 'Please sign in to Google to continue the upload.');
           await signIn();
           asset = await attempt();

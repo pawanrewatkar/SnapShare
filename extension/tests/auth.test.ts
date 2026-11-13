@@ -1,76 +1,66 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseAuthRedirect, pkceChallenge, getDriveAccessToken } from '@/features/authentication/auth';
-import { api, ApiError, friendlyError, getSession, setSession } from '@/services/api';
+import { identity } from './setup';
+import { authFetch, getAccessToken, signIn, signOut, fetchProfile, refreshAccount } from '@/features/authentication/auth';
+import { AuthError, friendlyError, getSession } from '@/services/api';
 
-const okSession = { token: 't', expiresAt: Date.now() + 3600_000, user: { id: 'u', email: 'a@b.c', name: null, avatarUrl: null } };
+const profile = (sub: string, email: string) => new Response(JSON.stringify({ sub, email, name: email.split('@')[0] }), { status: 200 });
 
 beforeEach(async () => {
-  await chrome.storage.local.remove('session');
-  await chrome.storage.session.remove('driveToken');
+  identity.token = 'tok-A';
+  identity.error = null;
+  identity.removed = [];
+  identity.grantedScopes = ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/drive.file'];
+  (globalThis as unknown as { __clientId: string }).__clientId = '123-abc.apps.googleusercontent.com';
+  await chrome.storage.local.remove('account');
   vi.unstubAllGlobals();
 });
 
-describe('OAuth redirect handling', () => {
-  const base = 'https://abcdefghijklmnopabcdefghijklmnop.chromiumapp.org/auth';
-  it('returns the code when state matches', () => {
-    expect(parseAuthRedirect(`${base}?code=abc&state=s1`, 's1')).toBe('abc');
+describe('Chrome Identity sign-in (mocked chrome.identity)', () => {
+  it('requests drive.file and stores the account profile', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => profile('sub-A', 'a@gmail.com')));
+    const s = await signIn();
+    expect(s.user).toMatchObject({ id: 'sub-A', email: 'a@gmail.com' });
+    expect(identity.getAuthToken).toHaveBeenCalledWith(expect.objectContaining({ interactive: true, scopes: expect.arrayContaining(['https://www.googleapis.com/auth/drive.file']) }));
+    expect((await getSession())?.user.email).toBe('a@gmail.com');
   });
-  it('rejects a state mismatch (CSRF)', () => {
-    expect(() => parseAuthRedirect(`${base}?code=abc&state=evil`, 's1')).toThrow(/state mismatch/);
+  it('refuses to run without a configured OAuth client id', async () => {
+    (globalThis as unknown as { __clientId: string }).__clientId = 'REPLACE_WITH_YOUR_CLIENT_ID.apps.googleusercontent.com';
+    await expect(getAccessToken()).rejects.toMatchObject({ code: 'not_configured' });
   });
-  it('reports permission denial / cancellation', () => {
-    expect(() => parseAuthRedirect(`${base}?error=access_denied&state=s1`, 's1')).toThrow(/cancelled or permission was denied/);
+  it('maps cancellation / permission denied', async () => {
+    identity.error = 'The user did not approve access.';
+    await expect(getAccessToken(true)).rejects.toMatchObject({ code: 'cancelled' });
   });
-  it('rejects a redirect without a code', () => {
-    expect(() => parseAuthRedirect(`${base}?state=s1`, 's1')).toThrow(/no authorization code/);
+  it('rejects tokens without the Drive scope (granular consent unticked)', async () => {
+    identity.grantedScopes = ['openid', 'email', 'profile'];
+    await expect(getAccessToken(true)).rejects.toMatchObject({ code: 'scope_denied' });
+    expect(identity.removed).toContain('tok-A');
   });
-  it('computes the RFC 7636 S256 challenge', async () => {
-    expect(await pkceChallenge('dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk')).toBe('E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM');
+  it('retries once with a fresh token when Google returns 401 (expired token)', async () => {
+    const f = vi.fn(async (_u: string, init?: RequestInit) => new Response('{}', { status: (init?.headers as Record<string, string>).Authorization === 'Bearer tok-A' ? 401 : 200 }));
+    identity.getAuthToken.mockImplementationOnce(async () => ({ token: 'tok-A', grantedScopes: identity.grantedScopes })).mockImplementationOnce(async () => ({ token: 'tok-B', grantedScopes: identity.grantedScopes }));
+    const res = await authFetch('https://www.googleapis.com/drive/v3/about', {}, f as unknown as typeof fetch);
+    expect(res.status).toBe(200);
+    expect(identity.removed).toEqual(['tok-A']);
   });
-});
-
-describe('API client and session handling', () => {
-  it('fails fast without a session', async () => {
-    await expect(api('/api/me')).rejects.toMatchObject({ code: 'unauthenticated' });
-  });
-  it('drops expired sessions', async () => {
-    await setSession({ ...okSession, expiresAt: Date.now() - 1 });
+  it('signing out removes cached tokens and the stored account', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => profile('sub-A', 'a@gmail.com')));
+    await signIn();
+    await signOut();
+    expect(identity.removed).toContain('tok-A');
+    expect(identity.clearAllCachedAuthTokens).toHaveBeenCalled();
     expect(await getSession()).toBeNull();
   });
-  it('clears the session when the backend says reauth is required (expired Google authorization)', async () => {
-    await setSession(okSession);
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: { code: 'reauth_required', message: 'expired' } }), { status: 401 })));
-    await expect(api('/api/me')).rejects.toMatchObject({ code: 'reauth_required' });
-    expect(await getSession()).toBeNull();
+  it('detects a different Google account and replaces the stored one', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => profile('sub-A', 'a@gmail.com')));
+    await signIn();
+    vi.stubGlobal('fetch', vi.fn(async () => profile('sub-B', 'b@gmail.com')));
+    await refreshAccount();
+    expect((await getSession())?.user.id).toBe('sub-B');
   });
-  it('maps network disconnection to a friendly error', async () => {
-    await setSession(okSession);
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch'); }));
-    const err = (await api("/api/me").catch((e: unknown) => e)) as ApiError;
-    expect(err).toBeInstanceOf(ApiError);
-    expect(err.code).toBe('network');
-    expect(friendlyError(err)).toMatch(/Network error/);
-  });
-  it('sends the bearer token and parses JSON', async () => {
-    await setSession(okSession);
-    const f = vi.fn(async () => new Response(JSON.stringify({ ok: 1 }), { status: 200 }));
-    vi.stubGlobal('fetch', f);
-    expect(await api('/api/me')).toEqual({ ok: 1 });
-    const init = (f.mock.calls[0] as unknown as [string, RequestInit])[1];
-    expect((init.headers as Record<string, string>).Authorization).toBe('Bearer t');
-  });
-  it('caches the Drive access token until shortly before expiry', async () => {
-    await setSession(okSession);
-    const f = vi.fn(async () => new Response(JSON.stringify({ accessToken: 'ya29', expiresAt: Date.now() + 3600_000 }), { status: 200 }));
-    vi.stubGlobal('fetch', f);
-    expect(await getDriveAccessToken()).toBe('ya29');
-    expect(await getDriveAccessToken()).toBe('ya29');
-    expect(f).toHaveBeenCalledTimes(1);
-    await getDriveAccessToken(true);
-    expect(f).toHaveBeenCalledTimes(2);
-  });
-  it('maps quota errors to a clear message', () => {
-    expect(friendlyError(new ApiError('drive_quota', 'x', 507))).toMatch(/storage is full/);
+  it('profile failure is an auth error; network errors are friendly', async () => {
+    await expect(fetchProfile('t', (async () => new Response('', { status: 401 })) as unknown as typeof fetch)).rejects.toBeInstanceOf(AuthError);
+    expect(friendlyError(new TypeError('Failed to fetch'))).toMatch(/Network error/);
   });
 });

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getSession, type Session } from '@/services/api';
+import { refreshAccount } from '@/features/authentication/auth';
 import { getSettings, saveSettings, type Settings } from '@/services/settings';
 import { sendBg } from '@/services/messaging';
 import { INITIAL_RECORDING_STATE } from '@/features/recording/state';
@@ -13,9 +14,10 @@ export function useSession() {
     setLoading(false);
   }, []);
   useEffect(() => {
-    void refresh();
+    // Show the stored account immediately, then confirm it with Chrome's current Google account.
+    void refresh().then(() => refreshAccount().then(() => refresh()));
     const onChange = (changes: Record<string, chrome.storage.StorageChange>, area: string) => {
-      if (area === 'local' && 'session' in changes) void refresh();
+      if (area === 'local' && 'account' in changes) void refresh();
     };
     chrome.storage.onChanged.addListener(onChange);
     return () => chrome.storage.onChanged.removeListener(onChange);

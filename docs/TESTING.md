@@ -2,6 +2,24 @@
 
 Four layers, kept separate on purpose. **Mocked tests prove our logic against fakes; they do not prove Google Drive, Google OAuth or Supabase behave as assumed.**
 
+## 0. Standalone-mode status (2026-11-13)
+
+| Test | Status |
+| --- | --- |
+| Extension unit + mocked tests (`npm test -w extension`) incl. Chrome-identity auth, folder creation/dedupe, per-account folders, file-only sharing, inherited-permission warning, gallery account isolation | **67 passed** (mocked — does not prove real Google behaviour) |
+| Real Chromium (`npm run test:e2e -w extension`): capture modes + editor | **9 passed** |
+| Real Google sign-in, real Drive folders/uploads | **BLOCKED** — no OAuth client ID/credentials available |
+| Two-account isolation (A shares one file with B; B can't see other files/folders; revoke removes access; switching accounts doesn't mix data) | **BLOCKED** — needs two real Gmail test users. Procedure below. |
+
+### Manual two-account procedure (run once the OAuth client exists)
+1. Chrome profile A (Gmail A): sign in, upload 2 screenshots + 1 recording. Verify Drive shows `SnapShare/Screenshots` and `SnapShare/Videos` only once each.
+2. Share screenshot #1 with Gmail B (Share → specific address). Folders' sharing in Drive must still show "Private".
+3. Chrome profile B (Gmail B): open the copied link → the image opens. Open `https://drive.google.com/drive/folders/<A's Screenshots id>` and the other file URLs → "You need access".
+4. A: Revoke → B reloads → "You need access".
+5. A: enable Anyone-with-link on screenshot #2 → incognito opens it; other files still need access.
+6. A: share the `Screenshots` folder manually in Drive → SnapShare's Share dialog must show the red inherited-access warning; Remove from folder → warning disappears.
+7. In profile B's SnapShare gallery, none of A's files or local uploads appear.
+
 ## 1. Unit tests (Vitest)
 
 `npm test` (both workspaces). Last run: **extension 60 passed, web 56 passed** (web count includes the mocked integration tests in §2).

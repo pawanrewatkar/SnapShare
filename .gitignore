@@ -17,3 +17,4 @@ supabase/.temp/
 next-env.d.ts
 *.tsbuildinfo
 dist-e2e/
+extension/keys/

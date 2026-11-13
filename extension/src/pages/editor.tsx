@@ -146,7 +146,12 @@ function Editor() {
     }
   };
 
-  const onSave = () => act('save', async () => (await saveEdited(), toast('success', 'Edited image saved. The original is kept separately.')));
+  const onSave = () =>
+    act('save', async () => {
+      const rec = await saveEdited();
+      toast('success', 'Edited image saved. The original is kept separately.');
+      if (session) await upload(rec.id); // stored in SnapShare/Screenshots in Drive
+    });
   const onCopyEdited = () => act('copy', async () => (await copyImageToClipboard(await eng().exportPng()), toast('success', 'Edited image copied — paste it anywhere')));
   const onCopyOriginal = () => act('copy-o', async () => (await copyImageToClipboard((await getCapture(originalId))!.blob), toast('success', 'Original copied')));
   const onDownloadEdited = () => act('dl', async () => {
@@ -167,7 +172,7 @@ function Editor() {
       // Upload the edited version if there are edits; uploadCapture uploads the original first as its parent.
       const target = e.isPristine ? captureId : e.status().dirty || !editedId ? (await saveEdited()).id : editedId;
       const asset = await upload(target);
-      if (asset && share) setShareAsset({ id: asset.id, filename: asset.filename });
+      if (asset && share) setShareAsset({ id: asset.id, filename: asset.name });
     });
 
   useEffect(() => {
@@ -376,7 +381,7 @@ function Editor() {
           </footer>
         </main>
       </div>
-      {shareAsset && <ShareDialog open assetId={shareAsset.id} filename={shareAsset.filename} onClose={() => setShareAsset(null)} />}
+      {shareAsset && <ShareDialog open fileId={shareAsset.id} filename={shareAsset.filename} onClose={() => setShareAsset(null)} />}
     </div>
   );
 }

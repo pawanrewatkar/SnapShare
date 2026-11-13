@@ -1,22 +1,62 @@
-import { FOLDER_FOR_MEDIA, type MediaAsset, type MediaType, type StorageQuota } from '@snapshare/shared';
+import type { MediaType } from '@snapshare/shared';
+import { platform } from '@/browser';
 import { getDriveAccessToken } from '@/features/authentication/auth';
-import { api } from '@/services/api';
+import { getSession, AuthError } from '@/services/api';
 import { deleteUploadSession, getCapture, getUploadSession, saveUploadSession, updateCapture, type CaptureRecord } from '@/services/db';
-import { DriveError, resumableUpload } from './upload';
+import { drive, type DriveFile } from './driveApi';
+import { resumableUpload } from './upload';
 
-type FolderMap = Record<'root' | 'screenshots' | 'edited' | 'videos', string>;
+/** My Drive/SnapShare/{Screenshots,Videos}. Edited screenshots also go to Screenshots. */
+export const FOLDER_NAMES = { root: 'SnapShare', screenshots: 'Screenshots', videos: 'Videos' } as const;
+export type FolderKey = keyof typeof FOLDER_NAMES;
+export type FolderMap = Record<FolderKey, string>;
 
-let folderCache: { userKey: string; folders: FolderMap } | null = null;
+export const folderForMedia = (m: MediaType): Exclude<FolderKey, 'root'> => (m === 'video' ? 'videos' : 'screenshots');
 
-/** Ensures SnapShare/{Screenshots,Edited Images,Videos} exist (backend finds existing ones before creating). */
-export async function ensureFolders(): Promise<FolderMap> {
-  const res = await api<{ userId: string; folders: FolderMap }>('/api/drive/folders', { method: 'POST' });
-  folderCache = { userKey: res.userId, folders: res.folders };
-  return res.folders;
+async function requireAccountId(): Promise<string> {
+  const s = await getSession();
+  if (!s) throw new AuthError('unauthenticated', 'Please sign in with Google first.');
+  return s.user.id;
 }
 
-export function mediaTypeForCapture(c: Pick<CaptureRecord, 'kind'>): MediaType {
-  return c.kind;
+const folderKey = (accountId: string) => `driveFolders:${accountId}`;
+const inflight = new Map<string, Promise<FolderMap>>();
+
+/**
+ * Finds or creates the folder tree for the signed-in account. Stored ids are re-validated; when a
+ * folder is missing we search (oldest match wins) before creating, and calls are de-duplicated so
+ * concurrent uploads never create duplicate folders.
+ */
+export function ensureFolders(): Promise<FolderMap> {
+  return requireAccountId().then((accountId) => {
+    const running = inflight.get(accountId);
+    if (running) return running;
+    const p = (async () => {
+      const stored = (await platform.storage.local.get<Partial<FolderMap>>(folderKey(accountId))) ?? {};
+      const result = {} as FolderMap;
+      const resolve = async (k: FolderKey, parent: string) => {
+        const id = stored[k];
+        if (id) {
+          const f = await drive.getFileIfExists(id, 'id,trashed,parents');
+          if (f && (k === 'root' || f.parents?.includes(parent))) return id;
+        }
+        const found = await drive.findFolders(FOLDER_NAMES[k], parent);
+        return found[0]?.id ?? (await drive.createFolder(FOLDER_NAMES[k], parent)).id;
+      };
+      result.root = await resolve('root', 'root');
+      result.screenshots = await resolve('screenshots', result.root);
+      result.videos = await resolve('videos', result.root);
+      await platform.storage.local.set(folderKey(accountId), result);
+      return result;
+    })().finally(() => inflight.delete(accountId));
+    inflight.set(accountId, p);
+    return p;
+  });
+}
+
+export async function cachedFolders(): Promise<FolderMap | null> {
+  const s = await getSession();
+  return s ? ((await platform.storage.local.get<FolderMap>(folderKey(s.user.id))) ?? null) : null;
 }
 
 export interface UploadProgress {
@@ -24,75 +64,45 @@ export interface UploadProgress {
   total: number;
 }
 
-/**
- * Uploads a local capture to the user's Drive and registers its metadata with the backend.
- * For edited images the original screenshot is uploaded first so the parent link is preserved.
- */
-export async function uploadCapture(captureId: string, onProgress?: (p: UploadProgress) => void, signal?: AbortSignal): Promise<MediaAsset> {
+/** Uploads a local capture into the signed-in user's Drive. Edited images upload their original first. */
+export async function uploadCapture(captureId: string, onProgress?: (p: UploadProgress) => void, signal?: AbortSignal): Promise<DriveFile> {
+  const accountId = await requireAccountId();
   const capture = await getCapture(captureId);
   if (!capture) throw new Error('Capture not found on this device');
-  if (capture.cloud) {
-    return api<MediaAsset>(`/api/assets/${capture.cloud.assetId}`);
+  if (capture.cloud && capture.cloud.accountId === accountId) {
+    const existing = await drive.getFileIfExists(capture.cloud.driveFileId, 'id,name,mimeType,size,webViewLink,trashed');
+    if (existing) return existing;
   }
-  let parentAssetId: string | null = null;
   if (capture.kind === 'edited' && capture.parentId) {
     const parent = await getCapture(capture.parentId);
-    if (parent) parentAssetId = parent.cloud?.assetId ?? (await uploadCapture(parent.id, undefined, signal)).id;
+    if (parent && parent.cloud?.accountId !== accountId) await uploadCapture(parent.id, undefined, signal).catch(() => undefined);
   }
-  const mediaType = mediaTypeForCapture(capture);
-  const folders = folderCache?.folders ?? (await ensureFolders());
-  const ext = capture.mimeType === 'video/webm' ? 'webm' : capture.mimeType === 'image/jpeg' ? 'jpg' : 'png';
-  const name = capture.filename.toLowerCase().endsWith(`.${ext}`) ? capture.filename : `${capture.filename}.${ext}`;
-
-  const doUpload = (folderId: string) =>
-    resumableUpload(
-      capture.blob,
-      {
-        name,
-        mimeType: capture.mimeType,
-        mediaType,
-        folderId,
-        captureId,
-        signal,
-        onProgress: (sent, total) => onProgress?.({ sent, total }),
+  const mediaType: MediaType = capture.kind;
+  const folders = await ensureFolders();
+  const name = withExtension(capture);
+  const file = await resumableUpload(
+    capture.blob,
+    { name, mimeType: capture.mimeType, mediaType, folderId: folders[folderForMedia(mediaType)], captureId, signal, onProgress: (sent, total) => onProgress?.({ sent, total }) },
+    {
+      fetch: (...a) => fetch(...a),
+      getToken: getDriveAccessToken,
+      loadSession: async () => {
+        const s = await getUploadSession(captureId);
+        return s && s.accountId === accountId ? s.sessionUrl : null;
       },
-      {
-        fetch: (...a) => fetch(...a),
-        getToken: getDriveAccessToken,
-        loadSession: async () => (await getUploadSession(captureId))?.sessionUrl ?? null,
-        saveSession: (url) => saveUploadSession({ captureId, sessionUrl: url, createdAt: Date.now() }),
-        clearSession: () => deleteUploadSession(captureId),
-      },
-    );
-
-  let file;
-  try {
-    file = await doUpload(folders[FOLDER_FOR_MEDIA[mediaType]]);
-  } catch (e) {
-    // Folder may have been deleted by the user in Drive: refresh folder ids once and retry.
-    if (e instanceof DriveError && e.code === 'server' && /parent|not found|file not found/i.test(e.message)) {
-      const fresh = await ensureFolders();
-      file = await doUpload(fresh[FOLDER_FOR_MEDIA[mediaType]]);
-    } else throw e;
-  }
-
-  const asset = await api<MediaAsset>('/api/assets', {
-    body: {
-      driveFileId: file.id,
-      filename: name,
-      mediaType,
-      mimeType: capture.mimeType,
-      size: capture.blob.size,
-      width: capture.width,
-      height: capture.height,
-      durationMs: capture.durationMs,
-      parentAssetId,
+      saveSession: (url) => saveUploadSession({ captureId, sessionUrl: url, createdAt: Date.now(), accountId }),
+      clearSession: () => deleteUploadSession(captureId),
     },
-  });
-  await updateCapture(captureId, { cloud: { assetId: asset.id, driveFileId: file.id, uploadedAt: Date.now() } });
-  return asset;
+  );
+  await updateCapture(captureId, { cloud: { assetId: file.id, driveFileId: file.id, uploadedAt: Date.now(), accountId } });
+  return { id: file.id, name: file.name, mimeType: file.mimeType, size: String(file.size) };
 }
 
-export function getStorageQuota(): Promise<StorageQuota> {
-  return api<StorageQuota>('/api/drive/storage');
+function withExtension(c: CaptureRecord): string {
+  const ext = c.mimeType === 'video/webm' ? 'webm' : c.mimeType === 'image/jpeg' ? 'jpg' : 'png';
+  return c.filename.toLowerCase().endsWith(`.${ext}`) ? c.filename : `${c.filename}.${ext}`;
+}
+
+export function getStorageQuota() {
+  return drive.about();
 }
