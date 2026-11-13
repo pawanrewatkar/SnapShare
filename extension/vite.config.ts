@@ -29,7 +29,8 @@ function manifestPlugin(clientId: string, e2e: boolean): Plugin {
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, import.meta.dirname, 'VITE_');
-  const clientId = (env.VITE_GOOGLE_CLIENT_ID ?? '').trim();
+  // Test builds never carry the real OAuth client (no Google calls from automated tests).
+  const clientId = mode === 'e2e' ? '' : (env.VITE_GOOGLE_CLIENT_ID ?? '').trim();
   return {
     plugins: [react(), tailwindcss(), manifestPlugin(clientId, mode === 'e2e')],
     resolve: { alias: { '@': resolve(import.meta.dirname, 'src') } },

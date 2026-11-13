@@ -115,6 +115,8 @@ function Gallery() {
   const [share, setShare] = useState<{ id: string; filename: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulk, setBulk] = useState<{ done: number; total: number } | null>(null);
   const { upload, uploading, progress } = useUpload();
   const highlight = new URLSearchParams(location.search).get('highlight');
 
@@ -180,24 +182,69 @@ function Gallery() {
       toast('success', 'Image copied to clipboard');
     });
 
+  /** Deletes one item without confirmation (Drive file for cloud items, local copy for device items). */
+  const deleteItem = async (item: GalleryItem) => {
+    if (item.status === 'missing') {
+      // Deleted in Drive already: drop the dead link and the local copy.
+      await deleteCapture(item.id);
+    } else if (item.source === 'local') {
+      await deleteCapture(item.id);
+    } else {
+      await drive.delete(item.id);
+      // Unlink any local copy so it can be re-uploaded later.
+      const linked = local.find((l) => l.cloud?.driveFileId === item.id);
+      if (linked) await updateCapture(linked.id, { cloud: null });
+    }
+  };
+
   const remove = (item: GalleryItem) =>
     act(`rm-${item.key}`, async () => {
-      if (item.status === 'missing') {
-        // Deleted in Drive: keep the local copy, forget the dead Drive link so it can be re-uploaded.
-        await updateCapture(item.id, { cloud: null });
-      } else if (item.source === 'local') {
-        if (!confirm(`Delete “${item.filename}” from this device?`)) return;
-        await deleteCapture(item.id);
-      } else {
-        if (!confirm(`Permanently delete “${item.filename}” from your Google Drive? Anyone it was shared with loses access.`)) return;
-        await drive.delete(item.id);
-        // Unlink any local copy so it can be re-uploaded later.
-        const linked = local.find((l) => l.cloud?.driveFileId === item.id);
-        if (linked) await updateCapture(linked.id, { cloud: null });
-      }
+      const msg =
+        item.source === 'cloud' && item.status !== 'missing'
+          ? `Permanently delete “${item.filename}” from your Google Drive? Anyone it was shared with loses access.`
+          : `Delete “${item.filename}” from this device?`;
+      if (!confirm(msg)) return;
+      await deleteItem(item);
+      setSelected((sel) => {
+        const n = new Set(sel);
+        n.delete(item.key);
+        return n;
+      });
       toast('success', 'Deleted');
       await load();
     });
+
+  const toggle = (key: string) =>
+    setSelected((sel) => {
+      const n = new Set(sel);
+      if (n.has(key)) n.delete(key);
+      else n.add(key);
+      return n;
+    });
+
+  const removeSelected = async () => {
+    const targets = items.filter((i) => selected.has(i.key));
+    if (!targets.length) return;
+    const inDrive = targets.filter((i) => i.source === 'cloud' && i.status !== 'missing').length;
+    const onDevice = targets.length - inDrive;
+    const parts = [inDrive ? `${inDrive} from your Google Drive (permanent; shared people lose access)` : '', onDevice ? `${onDevice} from this device` : ''].filter(Boolean);
+    if (!confirm(`Delete ${targets.length} file(s): ${parts.join(' and ')}?`)) return;
+    let failed = 0;
+    setBulk({ done: 0, total: targets.length });
+    for (const [i, item] of targets.entries()) {
+      try {
+        await deleteItem(item);
+      } catch {
+        failed++;
+      }
+      setBulk({ done: i + 1, total: targets.length });
+    }
+    setBulk(null);
+    setSelected(new Set());
+    if (failed) toast('error', `${targets.length - failed} deleted, ${failed} failed. Try again for the remaining files.`);
+    else toast('success', `${targets.length} file(s) deleted`);
+    await load();
+  };
 
   const copyLink = (item: GalleryItem) =>
     act(`ln-${item.key}`, async () => {
@@ -259,6 +306,33 @@ function Gallery() {
         </select>
         <input type="search" placeholder="Search by name…" value={q} onChange={(e) => setQ(e.target.value)} className="min-w-[200px] flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm dark:border-slate-600 dark:bg-slate-900" />
       </div>
+      {items.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg bg-slate-100 px-3 py-2 text-sm dark:bg-slate-800/60">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              aria-label="Select all"
+              checked={items.every((i) => selected.has(i.key))}
+              ref={(el) => {
+                if (el) el.indeterminate = selected.size > 0 && !items.every((i) => selected.has(i.key));
+              }}
+              onChange={(e) => setSelected(e.target.checked ? new Set(items.map((i) => i.key)) : new Set())}
+            />
+            Select all
+          </label>
+          {selected.size > 0 && (
+            <>
+              <span className="text-slate-500">{items.filter((i) => selected.has(i.key)).length} selected</span>
+              <Button size="sm" variant="danger" loading={!!bulk} onClick={() => void removeSelected()}>
+                <I.IconTrash /> {bulk ? `Deleting ${bulk.done}/${bulk.total}…` : 'Delete selected'}
+              </Button>
+              <Button size="sm" variant="ghost" disabled={!!bulk} onClick={() => setSelected(new Set())}>
+                Clear selection
+              </Button>
+            </>
+          )}
+        </div>
+      )}
       {uploading && (
         <div className="mb-4">
           <ProgressBar value={progress} />
@@ -275,7 +349,13 @@ function Gallery() {
       ) : (
         <ul className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {items.map((item) => (
-            <li key={item.key} className={`overflow-hidden rounded-xl border bg-white shadow-sm dark:bg-slate-900 ${highlight === item.id ? 'border-brand-500 ring-2 ring-brand-500' : 'border-slate-200 dark:border-slate-800'}`}>
+            <li
+              key={item.key}
+              className={`relative overflow-hidden rounded-xl border bg-white shadow-sm dark:bg-slate-900 ${selected.has(item.key) || highlight === item.id ? 'border-brand-500 ring-2 ring-brand-500' : 'border-slate-200 dark:border-slate-800'}`}
+            >
+              <label className="absolute left-2 top-2 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded-md bg-white/90 shadow dark:bg-slate-900/90" title="Select">
+                <input type="checkbox" aria-label={`Select ${item.filename}`} checked={selected.has(item.key)} onChange={() => toggle(item.key)} className="h-4 w-4" />
+              </label>
               <button className="block w-full" onClick={() => setPreview(item)} aria-label={`Preview ${item.filename}`}>
                 <Thumbnail item={item} />
               </button>
@@ -299,11 +379,16 @@ function Gallery() {
                     <span className="text-slate-500">Only on this device</span>
                   )}
                 </p>
-                <div className="mt-2 flex flex-wrap gap-1">
+                <div className="mt-2 flex flex-wrap items-center gap-1">
                   {item.status === 'missing' ? (
-                    <Button size="sm" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)}>
-                      Unlink (re-upload later)
-                    </Button>
+                    <>
+                      <Button size="sm" loading={busy === `up-${item.key}`} disabled={uploading} onClick={() => void updateCapture(item.id, { cloud: null }).then(() => uploadLocal(item))} title="Upload again">
+                        <I.IconUpload /> Re-upload
+                      </Button>
+                      <Button size="sm" className="text-red-600 dark:text-red-400" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)} title="Delete" aria-label="Delete">
+                        <I.IconTrash />
+                      </Button>
+                    </>
                   ) : (
                     <>
                       {item.source === 'local' && item.mediaType !== 'video' && (
@@ -319,8 +404,8 @@ function Gallery() {
                           <I.IconCopy />
                         </Button>
                       )}
-                      <Button size="sm" onClick={() => setRename({ item, value: item.filename })} title="Rename">
-                        Rename
+                      <Button size="sm" onClick={() => setRename({ item, value: item.filename })} title="Rename" aria-label="Rename">
+                        <I.IconText />
                       </Button>
                       {item.source === 'cloud' ? (
                         <>
@@ -336,7 +421,7 @@ function Gallery() {
                           <I.IconUpload />
                         </Button>
                       )}
-                      <Button size="sm" variant="ghost" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)} title="Delete">
+                      <Button size="sm" className="text-red-600 dark:text-red-400" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)} title="Delete" aria-label="Delete">
                         <I.IconTrash />
                       </Button>
                     </>
