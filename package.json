@@ -1,0 +1,16 @@
+{
+  "name": "snapshare",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["shared", "extension", "web"],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build -w extension && npm run build -w web",
+    "build:extension": "npm run build -w extension",
+    "build:web": "npm run build -w web",
+    "package:extension": "node scripts/package-extension.mjs"
+  },
+  "engines": { "node": ">=20.9.0" }
+}
