@@ -4,7 +4,8 @@ import { Button, EmptyState, IconButton, Logo, ProgressBar, Spinner, useToast } 
 import * as I from '@/components/icons';
 import { EditorEngine, HIGHLIGHT_COLORS, STROKE_COLORS, type EngineStatus, type Tool, type EditorDraftState } from '@/features/editor/engine';
 import { fitZoom, nextZoom } from '@/features/editor/geometry';
-import { deleteDraft, getCapture, getDraft, newId, putCapture, saveDraft, type CaptureRecord } from '@/services/db';
+import { deleteCapture, deleteDraft, getCapture, getDraft, newId, putCapture, saveDraft, type CaptureRecord } from '@/services/db';
+import { drive } from '@/features/drive/driveApi';
 import { copyImageToClipboard, downloadBlob } from '@/services/media';
 import { friendlyError } from '@/services/api';
 import { useSession } from '@/hooks';
@@ -175,6 +176,31 @@ function Editor() {
       if (asset && share) setShareAsset({ id: asset.id, filename: asset.name });
     });
 
+  /** Deletes this screenshot (and any edited copy) from this device and from Google Drive, then closes the editor. */
+  const onDelete = () =>
+    act('delete', async () => {
+      const ids = [...new Set([originalId, captureId, editedId].filter((x): x is string => !!x))];
+      const recs = (await Promise.all(ids.map((id) => getCapture(id)))).filter((r): r is CaptureRecord => !!r);
+      const inDrive = recs.some((r) => r.cloud);
+      if (!confirm(inDrive ? 'Delete this screenshot? It will also be permanently removed from your Google Drive.' : 'Delete this screenshot?')) return;
+      for (const r of recs) {
+        if (r.cloud) {
+          try {
+            await drive.delete(r.cloud.driveFileId);
+          } catch (err) {
+            if ((err as { code?: string }).code !== 'not_found') throw err; // already gone in Drive is fine
+          }
+        }
+        await deleteCapture(r.id);
+      }
+      await deleteDraft(captureId);
+      engineRef.current?.markSaved(); // no "unsaved changes" prompt on close
+      toast('success', 'Screenshot deleted');
+      window.close();
+      // If the browser refuses to close this tab, go to the gallery instead.
+      setTimeout(() => (location.href = 'gallery.html'), 300);
+    });
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
@@ -251,6 +277,9 @@ function Editor() {
           </Button>
           <Button size="sm" loading={busy === 'share'} disabled={uploading} onClick={() => void onUpload(true)}>
             <I.IconShare /> Share
+          </Button>
+          <Button size="sm" className="text-red-600 dark:text-red-400" loading={busy === 'delete'} disabled={uploading} onClick={() => void onDelete()} title="Delete this screenshot (also from Google Drive)">
+            <I.IconTrash /> Delete
           </Button>
         </div>
       </header>

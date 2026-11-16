@@ -160,16 +160,8 @@ export const drive = {
     return (await call(`/files/${encodeURIComponent(id)}`, { query: { alt: 'media' } })).blob();
   },
 
-  async thumbnailBlob(file: DriveFile): Promise<Blob | null> {
-    if (!file.thumbnailLink) return null;
-    const link = file.thumbnailLink.replace(/=s\d+$/, '=s480');
-    try {
-      const res = await fetch(link);
-      if (res.ok) return res.blob();
-      const authed = await fetcher(link);
-      return authed.ok ? authed.blob() : null;
-    } catch {
-      return null;
-    }
+  /** Drive's short-lived thumbnail URL (for an <img>; fetching it from the extension is blocked by CORS). */
+  thumbnailUrl(file: DriveFile): string | null {
+    return file.thumbnailLink ? file.thumbnailLink.replace(/=s\d+$/, '=s480') : null;
   },
 };

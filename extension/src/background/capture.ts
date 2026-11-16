@@ -72,6 +72,7 @@ export async function maybeAutoUpload(captureId: string) {
     await uploadCapture(captureId);
     await platform.storage.local.remove('lastAutoUploadError');
   } catch (e) {
+    if ((e as Error).name === 'CaptureDeletedError') return; // user deleted it; nothing to report
     await platform.storage.local.set('lastAutoUploadError', { captureId, message: (e as Error).message, at: Date.now() });
     await platform.setBadge('!', '#d97706').catch(() => undefined);
     await chrome.action.setTitle({ title: `SnapShare — Drive upload failed: ${(e as Error).message}. Open the Gallery to retry.` }).catch(() => undefined);

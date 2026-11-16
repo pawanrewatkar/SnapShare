@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { formatBytes, formatDuration } from '@snapshare/shared';
 import { mount } from './mount';
 import { Button, EmptyState, Logo, Modal, ProgressBar, Spinner, useToast } from '@/components/ui';
@@ -26,6 +26,7 @@ function Thumbnail({ item }: { item: GalleryItem }) {
   const ref = useRef<HTMLDivElement>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [useFull, setUseFull] = useState(false);
   useEffect(() => {
     if (item.mediaType === 'video') return;
     const el = ref.current;
@@ -41,9 +42,16 @@ function Thumbnail({ item }: { item: GalleryItem }) {
           const rec = await getCapture(item.id);
           if (rec && !cancelled) created = URL.createObjectURL(rec.blob);
         } else {
-          // Drive thumbnails are generated asynchronously; fall back to the (bounded) image itself.
-          const blob = (await drive.thumbnailBlob(item.file!)) ?? (item.size <= 15 * 1024 * 1024 ? await drive.downloadBlob(item.id) : null);
+          // Show Drive's thumbnail as a plain <img> (no fetch → no CORS errors). If it is missing or
+          // fails to load, fall back to the (bounded) image itself via the authenticated Drive API.
+          const thumb = !useFull ? drive.thumbnailUrl(item.file!) : null;
+          if (thumb) {
+            if (!cancelled) setUrl(thumb);
+            return;
+          }
+          const blob = item.size <= 15 * 1024 * 1024 ? await drive.downloadBlob(item.id) : null;
           if (blob && !cancelled) created = URL.createObjectURL(blob);
+          else if (!cancelled) setFailed(true);
         }
         if (!cancelled) setUrl(created);
       } catch {
@@ -57,13 +65,24 @@ function Thumbnail({ item }: { item: GalleryItem }) {
       obs.disconnect();
       if (created) URL.revokeObjectURL(created);
     };
-  }, [item.id, item.source, item.mediaType, item.status, item.file, item.size]);
+  }, [item.id, item.source, item.mediaType, item.status, item.file, item.size, useFull]);
   return (
     <div ref={ref} className="flex aspect-video items-center justify-center overflow-hidden bg-slate-100 dark:bg-slate-800">
       {item.mediaType === 'video' ? (
         <I.IconVideo width={32} height={32} className="text-slate-400" />
       ) : url ? (
-        <img src={url} alt="" className="h-full w-full object-cover object-top" />
+        <img
+          src={url}
+          alt=""
+          referrerPolicy="no-referrer"
+          className="h-full w-full object-cover object-top"
+          onError={() => {
+            if (item.source === 'cloud' && !useFull) {
+              setUrl(null);
+              setUseFull(true);
+            } else setFailed(true);
+          }}
+        />
       ) : failed ? (
         <span className="text-xs text-slate-400">No preview</span>
       ) : (
@@ -73,10 +92,152 @@ function Thumbnail({ item }: { item: GalleryItem }) {
   );
 }
 
-function PreviewModal({ item, onClose }: { item: GalleryItem; onClose: () => void }) {
+const Chevron = ({ dir }: { dir: 'left' | 'right' }) => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d={dir === 'left' ? 'M15 18l-6-6 6-6' : 'M9 18l6-6-6-6'} />
+  </svg>
+);
+
+/** Fixed-size icon action: the spinner replaces the icon while busy, so neighbours never shift. */
+function ActionBtn({ label, loading, danger, disabled, onClick, children }: { label: string; loading?: boolean; danger?: boolean; disabled?: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <Button size="sm" className={`h-8 w-9 shrink-0 px-0! ${danger ? 'text-red-600 dark:text-red-400' : ''}`} disabled={disabled || loading} onClick={onClick} title={label} aria-label={label}>
+      {loading ? <Spinner className="h-3.5 w-3.5" /> : children}
+    </Button>
+  );
+}
+
+const MAX_ZOOM = 8;
+
+/**
+ * Image viewer with zoom: buttons (− / + / Fit), Ctrl+mouse wheel at the cursor, double-click,
+ * keys + − 0. When zoomed in, drag the image (or scroll) to move around.
+ */
+function ZoomableImage({ src, alt }: { src: string; alt: string }) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const [natural, setNatural] = useState<{ w: number; h: number } | null>(null);
+  const [fit, setFit] = useState(1); // scale at which the whole image fits the box
+  const [zoom, setZoom] = useState(1); // multiplier on top of `fit` (1 = fit)
+  const anchor = useRef<{ fx: number; fy: number; cx: number; cy: number } | null>(null);
+  const pan = useRef<{ x: number; y: number; sl: number; st: number } | null>(null);
+
+  const measure = useCallback(() => {
+    const box = boxRef.current;
+    if (!box || !natural) return;
+    setFit(Math.min(1, box.clientWidth / natural.w, box.clientHeight / natural.h));
+  }, [natural]);
+  useEffect(() => {
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [measure]);
+
+  /** Zooms keeping the point under (cx, cy) — box coordinates — fixed; defaults to the centre. */
+  const zoomTo = useCallback((next: number, cx?: number, cy?: number) => {
+    const box = boxRef.current;
+    if (!box) return;
+    const z = Math.min(MAX_ZOOM, Math.max(1, next));
+    const px = cx ?? box.clientWidth / 2;
+    const py = cy ?? box.clientHeight / 2;
+    anchor.current = { fx: (box.scrollLeft + px) / box.scrollWidth, fy: (box.scrollTop + py) / box.scrollHeight, cx: px, cy: py };
+    setZoom(z);
+  }, []);
+
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    const a = anchor.current;
+    if (!box || !a) return;
+    anchor.current = null;
+    box.scrollLeft = a.fx * box.scrollWidth - a.cx;
+    box.scrollTop = a.fy * box.scrollHeight - a.cy;
+  }, [zoom]);
+
+  // Ctrl + wheel zooms at the cursor (non-passive so the page itself doesn't zoom).
+  useEffect(() => {
+    const box = boxRef.current;
+    if (!box) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const r = box.getBoundingClientRect();
+      zoomTo(zoom * (e.deltaY < 0 ? 1.2 : 1 / 1.2), e.clientX - r.left, e.clientY - r.top);
+    };
+    box.addEventListener('wheel', onWheel, { passive: false });
+    return () => box.removeEventListener('wheel', onWheel);
+  }, [zoom, zoomTo]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = (e.target as HTMLElement).tagName;
+      if (t === 'INPUT' || t === 'TEXTAREA' || e.ctrlKey || e.metaKey) return;
+      if (e.key === '+' || e.key === '=') zoomTo(zoom * 1.25);
+      else if (e.key === '-' || e.key === '_') zoomTo(zoom / 1.25);
+      else if (e.key === '0') zoomTo(1);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoom, zoomTo]);
+
+  const scale = fit * zoom;
+  const zoomed = zoom > 1.001;
+  return (
+    <div className="relative w-full">
+      <div
+        ref={boxRef}
+        className={`h-[60vh] w-full overflow-auto rounded-lg bg-slate-100 dark:bg-slate-950 ${zoomed ? 'cursor-grab active:cursor-grabbing' : 'cursor-zoom-in'}`}
+        onDoubleClick={(e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          zoomTo(zoomed ? 1 : 2.5, e.clientX - r.left, e.clientY - r.top);
+        }}
+        onMouseDown={(e) => {
+          if (!zoomed || e.button !== 0) return;
+          e.preventDefault();
+          pan.current = { x: e.clientX, y: e.clientY, sl: e.currentTarget.scrollLeft, st: e.currentTarget.scrollTop };
+        }}
+        onMouseMove={(e) => {
+          const p = pan.current;
+          if (!p) return;
+          e.currentTarget.scrollLeft = p.sl - (e.clientX - p.x);
+          e.currentTarget.scrollTop = p.st - (e.clientY - p.y);
+        }}
+        onMouseUp={() => (pan.current = null)}
+        onMouseLeave={() => (pan.current = null)}
+      >
+        <div className="flex min-h-full min-w-full w-max items-center justify-center">
+          <img
+            src={src}
+            alt={alt}
+            draggable={false}
+            onLoad={(e) => setNatural({ w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight })}
+            style={natural ? { width: natural.w * scale, height: natural.h * scale, maxWidth: 'none' } : { maxHeight: '60vh' }}
+            className="select-none"
+          />
+        </div>
+      </div>
+      <div className="absolute bottom-2 right-4 flex items-center gap-1 rounded-lg bg-white/90 p-1 shadow dark:bg-slate-800/90">
+        <ActionBtn label="Zoom out (−)" disabled={!zoomed} onClick={() => zoomTo(zoom / 1.25)}>
+          <span className="text-base leading-none">−</span>
+        </ActionBtn>
+        <span className="w-12 text-center text-xs tabular-nums text-slate-600 dark:text-slate-300" title="Size compared with the original image">
+          {Math.round(scale * 100)}%
+        </span>
+        <ActionBtn label="Zoom in (+)" disabled={zoom >= MAX_ZOOM} onClick={() => zoomTo(zoom * 1.25)}>
+          <span className="text-base leading-none">+</span>
+        </ActionBtn>
+        <Button size="sm" className="h-8" disabled={!zoomed} onClick={() => zoomTo(1)} title="Fit to window (0)">
+          Fit
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PreviewModal({ item, index, total, onPrev, onNext, onClose, actions }: { item: GalleryItem; index: number; total: number; onPrev: () => void; onNext: () => void; onClose: () => void; actions: ReactNode }) {
   const [src, setSrc] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
+    setSrc(null);
+    setErr(null);
     let created: string | null = null;
     (async () => {
       if (item.source === 'local') {
@@ -92,10 +253,26 @@ function PreviewModal({ item, onClose }: { item: GalleryItem; onClose: () => voi
     return () => {
       if (created) URL.revokeObjectURL(created);
     };
-  }, [item]);
+    // Keyed on the item identity: list items are re-created on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.key, item.status]);
   return (
     <Modal open title={item.filename} onClose={onClose} wide>
-      {err ? <p className="text-red-600">{err}</p> : !src ? <Spinner /> : item.mediaType === 'video' ? <video src={src} controls autoPlay className="max-h-[70vh] w-full bg-black" /> : <img src={src} alt={item.filename} className="max-h-[70vh] w-full object-contain" />}
+      <div className="flex min-h-[200px] items-center justify-center">
+        {err ? <p className="text-red-600">{err}</p> : !src ? <Spinner /> : item.mediaType === 'video' ? <video key={item.key} src={src} controls autoPlay className="max-h-[60vh] w-full bg-black" /> : <ZoomableImage key={item.key} src={src} alt={item.filename} />}
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-center gap-1">{actions}</div>
+      <div className="mt-3 flex items-center justify-center gap-4">
+        <ActionBtn label="Previous (←)" disabled={index <= 0} onClick={onPrev}>
+          <Chevron dir="left" />
+        </ActionBtn>
+        <span className="min-w-16 text-center text-sm text-slate-500">
+          {index + 1} / {total}
+        </span>
+        <ActionBtn label="Next (→)" disabled={index >= total - 1} onClick={onNext}>
+          <Chevron dir="right" />
+        </ActionBtn>
+      </div>
     </Modal>
   );
 }
@@ -110,7 +287,7 @@ function Gallery() {
   const [local, setLocal] = useState<CaptureMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [preview, setPreview] = useState<GalleryItem | null>(null);
+  const [preview, setPreview] = useState<number | null>(null); // index into `items`
   const [rename, setRename] = useState<{ item: GalleryItem; value: string } | null>(null);
   const [share, setShare] = useState<{ id: string; filename: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -146,6 +323,22 @@ function Gallery() {
   };
 
   const items = mergeItems(assets, local, category, q, source, session?.user.id ?? null);
+  // After a delete the same index shows the next file; close when nothing is left.
+  const previewIndex = preview === null || !items.length ? null : Math.min(preview, items.length - 1);
+  const previewItem = previewIndex === null ? null : items[previewIndex];
+  const dialogOpen = !!rename || !!share;
+
+  useEffect(() => {
+    if (previewIndex === null) return;
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement;
+      if (dialogOpen || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'VIDEO') return;
+      if (e.key === 'ArrowLeft' && previewIndex > 0) setPreview(previewIndex - 1);
+      else if (e.key === 'ArrowRight' && previewIndex < items.length - 1) setPreview(previewIndex + 1);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [previewIndex, items.length, dialogOpen]);
 
   const act = async (key: string, fn: () => Promise<void>) => {
     setBusy(key);
@@ -258,6 +451,55 @@ function Gallery() {
       if (await upload(item.id)) await load();
     });
 
+  /** Action buttons shared by the cards and the preview. Fixed sizes, so nothing moves while one is busy. */
+  const renderActions = (item: GalleryItem) =>
+    item.status === 'missing' ? (
+      <>
+        <Button size="sm" loading={busy === `up-${item.key}`} disabled={uploading} onClick={() => void updateCapture(item.id, { cloud: null }).then(() => uploadLocal(item))} title="Upload again">
+          <I.IconUpload /> Re-upload
+        </Button>
+        <ActionBtn label="Delete" danger loading={busy === `rm-${item.key}`} onClick={() => void remove(item)}>
+          <I.IconTrash />
+        </ActionBtn>
+      </>
+    ) : (
+      <>
+        {item.source === 'local' && item.mediaType !== 'video' && (
+          <Button size="sm" onClick={() => void chrome.tabs.create({ url: chrome.runtime.getURL(`editor.html?id=${item.id}`) })}>
+            <I.IconEdit /> Edit
+          </Button>
+        )}
+        <ActionBtn label="Download" loading={busy === `dl-${item.key}`} onClick={() => void download(item)}>
+          <I.IconDownload />
+        </ActionBtn>
+        {item.mediaType !== 'video' && (
+          <ActionBtn label="Copy image" loading={busy === `cp-${item.key}`} onClick={() => void copyImage(item)}>
+            <I.IconCopy />
+          </ActionBtn>
+        )}
+        <ActionBtn label="Rename" onClick={() => setRename({ item, value: item.filename })}>
+          <I.IconText />
+        </ActionBtn>
+        {item.source === 'cloud' ? (
+          <>
+            <ActionBtn label="Copy share link" loading={busy === `ln-${item.key}`} onClick={() => void copyLink(item)}>
+              <I.IconLink />
+            </ActionBtn>
+            <ActionBtn label="Sharing settings" onClick={() => setShare({ id: item.id, filename: item.filename })}>
+              <I.IconShare />
+            </ActionBtn>
+          </>
+        ) : (
+          <ActionBtn label="Upload to Google Drive" loading={busy === `up-${item.key}`} disabled={uploading} onClick={() => void uploadLocal(item)}>
+            <I.IconUpload />
+          </ActionBtn>
+        )}
+        <ActionBtn label="Delete" danger loading={busy === `rm-${item.key}`} onClick={() => void remove(item)}>
+          <I.IconTrash />
+        </ActionBtn>
+      </>
+    );
+
   const submitRename = () =>
     rename &&
     act('rename', async () => {
@@ -273,7 +515,9 @@ function Gallery() {
     });
 
   return (
-    <div className="mx-auto max-w-7xl p-6">
+    <div className="mx-auto max-w-7xl px-6 pb-6">
+      {/* Header, filters and selection actions stay pinned while the grid scrolls. */}
+      <div className="sticky top-0 z-20 -mx-6 mb-2 border-b border-slate-200 bg-slate-50 px-6 pt-6 dark:border-slate-800 dark:bg-slate-950">
       <header className="mb-6 flex flex-wrap items-center gap-4">
         <Logo />
         <h1 className="text-lg font-semibold text-slate-500">Gallery</h1>
@@ -333,6 +577,7 @@ function Gallery() {
           )}
         </div>
       )}
+      </div>
       {uploading && (
         <div className="mb-4">
           <ProgressBar value={progress} />
@@ -356,7 +601,7 @@ function Gallery() {
               <label className="absolute left-2 top-2 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded-md bg-white/90 shadow dark:bg-slate-900/90" title="Select">
                 <input type="checkbox" aria-label={`Select ${item.filename}`} checked={selected.has(item.key)} onChange={() => toggle(item.key)} className="h-4 w-4" />
               </label>
-              <button className="block w-full" onClick={() => setPreview(item)} aria-label={`Preview ${item.filename}`}>
+              <button className="block w-full" onClick={() => setPreview(items.indexOf(item))} aria-label={`Preview ${item.filename}`}>
                 <Thumbnail item={item} />
               </button>
               <div className="p-3">
@@ -379,61 +624,24 @@ function Gallery() {
                     <span className="text-slate-500">Only on this device</span>
                   )}
                 </p>
-                <div className="mt-2 flex flex-wrap items-center gap-1">
-                  {item.status === 'missing' ? (
-                    <>
-                      <Button size="sm" loading={busy === `up-${item.key}`} disabled={uploading} onClick={() => void updateCapture(item.id, { cloud: null }).then(() => uploadLocal(item))} title="Upload again">
-                        <I.IconUpload /> Re-upload
-                      </Button>
-                      <Button size="sm" className="text-red-600 dark:text-red-400" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)} title="Delete" aria-label="Delete">
-                        <I.IconTrash />
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      {item.source === 'local' && item.mediaType !== 'video' && (
-                        <Button size="sm" onClick={() => void chrome.tabs.create({ url: chrome.runtime.getURL(`editor.html?id=${item.id}`) })}>
-                          <I.IconEdit /> Edit
-                        </Button>
-                      )}
-                      <Button size="sm" loading={busy === `dl-${item.key}`} onClick={() => void download(item)}>
-                        <I.IconDownload />
-                      </Button>
-                      {item.mediaType !== 'video' && (
-                        <Button size="sm" loading={busy === `cp-${item.key}`} onClick={() => void copyImage(item)} title="Copy image">
-                          <I.IconCopy />
-                        </Button>
-                      )}
-                      <Button size="sm" onClick={() => setRename({ item, value: item.filename })} title="Rename" aria-label="Rename">
-                        <I.IconText />
-                      </Button>
-                      {item.source === 'cloud' ? (
-                        <>
-                          <Button size="sm" loading={busy === `ln-${item.key}`} onClick={() => void copyLink(item)} title="Copy share link">
-                            <I.IconLink />
-                          </Button>
-                          <Button size="sm" onClick={() => setShare({ id: item.id, filename: item.filename })} title="Sharing settings">
-                            <I.IconShare />
-                          </Button>
-                        </>
-                      ) : (
-                        <Button size="sm" loading={busy === `up-${item.key}`} disabled={uploading} onClick={() => void uploadLocal(item)} title="Upload to Google Drive">
-                          <I.IconUpload />
-                        </Button>
-                      )}
-                      <Button size="sm" className="text-red-600 dark:text-red-400" loading={busy === `rm-${item.key}`} onClick={() => void remove(item)} title="Delete" aria-label="Delete">
-                        <I.IconTrash />
-                      </Button>
-                    </>
-                  )}
-                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-1">{renderActions(item)}</div>
               </div>
             </li>
           ))}
         </ul>
       )}
 
-      {preview && <PreviewModal item={preview} onClose={() => setPreview(null)} />}
+      {previewItem && previewIndex !== null && (
+        <PreviewModal
+          item={previewItem}
+          index={previewIndex}
+          total={items.length}
+          onPrev={() => setPreview(Math.max(0, previewIndex - 1))}
+          onNext={() => setPreview(Math.min(items.length - 1, previewIndex + 1))}
+          onClose={() => !dialogOpen && setPreview(null)}
+          actions={renderActions(previewItem)}
+        />
+      )}
       {share && <ShareDialog open fileId={share.id} filename={share.filename} onClose={() => setShare(null)} />}
       <Modal open={!!rename} title="Rename file" onClose={() => setRename(null)}>
         <form

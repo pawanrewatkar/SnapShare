@@ -142,10 +142,18 @@ const Z = '2147483647';
     const host = document.createElement('div');
     host.setAttribute('data-snapshare', 'region');
     const shadow = host.attachShadow({ mode: 'open' });
+    // High-contrast crosshair: dark outline with a white core, visible on light and dark pages.
+    const cross =
+      `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>` +
+      `<path d='M16 2v28M2 16h28' stroke='black' stroke-width='4' stroke-linecap='round'/>` +
+      `<path d='M16 3v26M3 16h26' stroke='white' stroke-width='2'/></svg>`;
+    const crossCursor = `url("data:image/svg+xml,${encodeURIComponent(cross)}") 16 16, crosshair`;
     shadow.innerHTML = `<style>
-      .layer{position:fixed;inset:0;z-index:${Z};cursor:crosshair;user-select:none}
+      .layer{position:fixed;inset:0;z-index:${Z};cursor:${crossCursor};user-select:none}
       .shade{position:absolute;background:rgba(15,23,42,.45);pointer-events:none}
       .sel{position:absolute;outline:2px solid #6366f1;box-shadow:0 0 0 1px rgba(255,255,255,.6) inset;pointer-events:none}
+      .h{position:absolute;width:8px;height:8px;background:#fff;border:1.5px solid #6366f1;border-radius:2px;margin:-5px 0 0 -5px}
+      .sel.dragging .h{display:none}
       .dims{position:absolute;background:#111827;color:#fff;font:12px system-ui,sans-serif;padding:3px 6px;border-radius:4px;pointer-events:none;white-space:nowrap}
       .hint{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#111827;color:#fff;font:13px system-ui,sans-serif;padding:8px 12px;border-radius:8px;pointer-events:none}
       .actions{position:absolute;display:none;gap:6px}
@@ -153,9 +161,11 @@ const Z = '2147483647';
       .ok{background:#6366f1;color:#fff}.cancel{background:#fff;color:#111827}
     </style>
     <div class="layer"><div class="shade s1"></div><div class="shade s2"></div><div class="shade s3"></div><div class="shade s4"></div>
-    <div class="sel" hidden></div><div class="dims" hidden></div>
+    <div class="sel" hidden>${['0,0', '50,0', '100,0', '0,50', '100,50', '0,100', '50,100', '100,100']
+      .map((p) => `<div class="h" style="left:${p.split(',')[0]}%;top:${p.split(',')[1]}%"></div>`)
+      .join('')}</div><div class="dims" hidden></div>
     <div class="actions"><button class="cancel">Cancel (Esc)</button><button class="ok">Capture (Enter)</button></div>
-    <div class="hint">Drag to select an area · Esc to cancel</div></div>`;
+    <div class="hint">Drag to select an area · drag the selection to move or its edges to resize · Esc to cancel</div></div>`;
     document.documentElement.appendChild(host);
     const layer = shadow.querySelector('.layer') as HTMLElement;
     const sel = shadow.querySelector('.sel') as HTMLElement;
@@ -163,8 +173,12 @@ const Z = '2147483647';
     const actions = shadow.querySelector('.actions') as HTMLElement;
     const hint = shadow.querySelector('.hint') as HTMLElement;
     const shades = Array.from(shadow.querySelectorAll<HTMLElement>('.shade'));
-    let start: { x: number; y: number } | null = null;
     let rect = { x: 0, y: 0, width: 0, height: 0 };
+    type Edges = { l: boolean; r: boolean; t: boolean; b: boolean };
+    type Drag =
+      | { mode: 'new'; x: number; y: number }
+      | { mode: 'move' | 'resize'; x: number; y: number; orig: typeof rect; edges?: Edges };
+    let drag: Drag | null = null;
     let done = false;
 
     const paint = () => {
@@ -215,34 +229,94 @@ const Z = '2147483647';
     };
     window.addEventListener('keydown', onKey, true);
 
-    layer.addEventListener('mousedown', (e) => {
-      if ((e.target as HTMLElement).tagName === 'BUTTON') return;
-      start = { x: e.clientX, y: e.clientY };
-      actions.style.display = 'none';
-      hint.style.display = 'none';
-      rect = { x: e.clientX, y: e.clientY, width: 0, height: 0 };
-      paint();
-    });
-    layer.addEventListener('mousemove', (e) => {
-      if (!start) return;
-      rect = normalizeRect(start.x, start.y, e.clientX, e.clientY, window.innerWidth, window.innerHeight);
-      paint();
-    });
-    layer.addEventListener('mouseup', () => {
-      if (!start) return;
-      start = null;
-      if (rect.width < 4 || rect.height < 4) {
-        rect = { x: 0, y: 0, width: 0, height: 0 };
-        hint.style.display = '';
-        paint();
-        return;
-      }
+    /** What the pointer is over: an edge/corner of the selection (resize), its inside (move) or nothing. */
+    const hitTest = (px: number, py: number): { mode: 'move' } | { mode: 'resize'; edges: Edges } | null => {
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      const T = 8;
+      const { x, y, width: w, height: h } = rect;
+      if (px < x - T || px > x + w + T || py < y - T || py > y + h + T) return null;
+      const edges = { l: Math.abs(px - x) <= T, r: Math.abs(px - (x + w)) <= T, t: Math.abs(py - y) <= T, b: Math.abs(py - (y + h)) <= T };
+      if (edges.l || edges.r || edges.t || edges.b) return { mode: 'resize', edges };
+      return px > x && px < x + w && py > y && py < y + h ? { mode: 'move' } : null;
+    };
+
+    const cursorFor = (hit: ReturnType<typeof hitTest>) => {
+      if (!hit) return '';
+      if (hit.mode === 'move') return 'move';
+      const { l, r, t, b } = hit.edges;
+      if ((l && t) || (r && b)) return 'nwse-resize';
+      if ((r && t) || (l && b)) return 'nesw-resize';
+      return l || r ? 'ew-resize' : 'ns-resize';
+    };
+
+    const showActions = () => {
       actions.style.display = 'flex';
       const below = rect.y + rect.height + 40 < window.innerHeight;
       Object.assign(actions.style, {
         left: `${Math.max(4, Math.min(rect.x + rect.width - 200, window.innerWidth - 210))}px`,
         top: below ? `${rect.y + rect.height + 8}px` : `${Math.max(4, rect.y + 8)}px`,
       });
+    };
+
+    layer.addEventListener('mousedown', (e) => {
+      if ((e.target as HTMLElement).tagName === 'BUTTON' || e.button !== 0) return;
+      actions.style.display = 'none';
+      hint.style.display = 'none';
+      const hit = hitTest(e.clientX, e.clientY);
+      if (hit) {
+        drag = { mode: hit.mode, x: e.clientX, y: e.clientY, orig: { ...rect }, edges: hit.mode === 'resize' ? hit.edges : undefined };
+      } else {
+        drag = { mode: 'new', x: e.clientX, y: e.clientY };
+        rect = { x: e.clientX, y: e.clientY, width: 0, height: 0 };
+      }
+      sel.classList.add('dragging');
+      paint();
+    });
+    layer.addEventListener('mousemove', (e) => {
+      const W = window.innerWidth;
+      const H = window.innerHeight;
+      if (!drag) {
+        layer.style.cursor = cursorFor(hitTest(e.clientX, e.clientY));
+        return;
+      }
+      if (drag.mode === 'new') {
+        rect = normalizeRect(drag.x, drag.y, e.clientX, e.clientY, W, H);
+      } else if (drag.mode === 'move') {
+        const o = drag.orig;
+        rect = {
+          ...o,
+          x: Math.max(0, Math.min(W - o.width, o.x + e.clientX - drag.x)),
+          y: Math.max(0, Math.min(H - o.height, o.y + e.clientY - drag.y)),
+        };
+      } else {
+        const o = drag.orig;
+        const ed = drag.edges!;
+        const dx = e.clientX - drag.x;
+        const dy = e.clientY - drag.y;
+        rect = normalizeRect(
+          o.x + (ed.l ? dx : 0),
+          o.y + (ed.t ? dy : 0),
+          o.x + o.width + (ed.r ? dx : 0),
+          o.y + o.height + (ed.b ? dy : 0),
+          W,
+          H,
+        );
+      }
+      paint();
+    });
+    layer.addEventListener('mouseup', (e) => {
+      if (!drag) return;
+      drag = null;
+      sel.classList.remove('dragging');
+      if (rect.width < 4 || rect.height < 4) {
+        rect = { x: 0, y: 0, width: 0, height: 0 };
+        hint.style.display = '';
+        layer.style.cursor = '';
+        paint();
+        return;
+      }
+      layer.style.cursor = cursorFor(hitTest(e.clientX, e.clientY));
+      showActions();
     });
     shadow.querySelector('.ok')!.addEventListener('click', () => void finish(true));
     shadow.querySelector('.cancel')!.addEventListener('click', () => void finish(false));

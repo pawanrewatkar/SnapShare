@@ -64,11 +64,19 @@ export interface UploadProgress {
   total: number;
 }
 
+/** Thrown when the capture was deleted on this device before or during its upload. */
+export class CaptureDeletedError extends Error {
+  constructor() {
+    super('Capture not found on this device');
+    this.name = 'CaptureDeletedError';
+  }
+}
+
 /** Uploads a local capture into the signed-in user's Drive. Edited images upload their original first. */
 export async function uploadCapture(captureId: string, onProgress?: (p: UploadProgress) => void, signal?: AbortSignal): Promise<DriveFile> {
   const accountId = await requireAccountId();
   const capture = await getCapture(captureId);
-  if (!capture) throw new Error('Capture not found on this device');
+  if (!capture) throw new CaptureDeletedError();
   if (capture.cloud && capture.cloud.accountId === accountId) {
     const existing = await drive.getFileIfExists(capture.cloud.driveFileId, 'id,name,mimeType,size,webViewLink,trashed');
     if (existing) return existing;
@@ -94,7 +102,12 @@ export async function uploadCapture(captureId: string, onProgress?: (p: UploadPr
       clearSession: () => deleteUploadSession(captureId),
     },
   );
-  await updateCapture(captureId, { cloud: { assetId: file.id, driveFileId: file.id, uploadedAt: Date.now(), accountId } });
+  const still = await updateCapture(captureId, { cloud: { assetId: file.id, driveFileId: file.id, uploadedAt: Date.now(), accountId } });
+  if (!still) {
+    // The user deleted this capture while it was uploading: remove the file that just landed in Drive.
+    await drive.delete(file.id).catch(() => undefined);
+    throw new CaptureDeletedError();
+  }
   return { id: file.id, name: file.name, mimeType: file.mimeType, size: String(file.size) };
 }
 
