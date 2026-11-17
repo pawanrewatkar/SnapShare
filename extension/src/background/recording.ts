@@ -2,7 +2,7 @@ import { platform } from '@/browser';
 import { INITIAL_RECORDING_STATE, recordingReducer, elapsedMs, type RecordingAction } from '@/features/recording/state';
 import { assembleRecording } from '@/features/recording/session';
 import { listChunkRecordingIds, newId } from '@/services/db';
-import { maybeAutoUpload } from './capture';
+import { maybeAutoUpload, openRecorderWindow, splitViewShown } from './capture';
 import type { RecorderCommand, RecorderEvent, RecordingOptions, RecordingState } from '@/types/messages';
 
 const KEY = 'recState';
@@ -56,8 +56,12 @@ export function startRecording(options: RecordingOptions): Promise<RecordingStat
     const state = await getRecordingState();
     if (state.phase === 'error') await dispatch({ type: 'RESET' });
     const recordingId = newId();
-    if (options.mode === 'tab') {
-      const tab = await platform.getActiveTab();
+    // Tab capture records a single tab; in a Chrome split view record the whole window instead
+    // (the recorder page asks Chrome to preselect "Window" in its picker).
+    const active = options.mode === 'tab' ? await platform.getActiveTab() : null;
+    const split = options.mode === 'tab' && (await splitViewShown(active?.id));
+    if (options.mode === 'tab' && !split) {
+      const tab = active;
       if (!tab) throw new Error('No active tab to record');
       if (tab.url && /^(chrome|edge|about|devtools|chrome-extension):/.test(tab.url)) throw new Error('Chrome does not allow recording browser internal pages.');
       // getMediaStreamId must be called while the extension is invoked on the tab (popup click / shortcut).
@@ -72,9 +76,10 @@ export function startRecording(options: RecordingOptions): Promise<RecordingStat
         throw e;
       }
     } else {
-      const q = new URLSearchParams({ action: 'record', rid: recordingId, mic: options.microphone ? '1' : '0', audio: options.systemAudio ? '1' : '0' });
-      const tab = await platform.openExtensionPage(`recorder.html?${q}`);
-      await dispatch({ type: 'START_REQUESTED', mode: 'screen', recordingId, ownerTabId: tab.id });
+      const q = new URLSearchParams({ action: 'record', rid: recordingId, mic: options.microphone ? '1' : '0', audio: options.systemAudio ? '1' : '0', ...(split ? { split: '1' } : {}) });
+      // Own window (not a tab), so the window to record — e.g. a split view — stays visible in Chrome's picker.
+      const ownerTabId = await openRecorderWindow(Object.fromEntries(q));
+      await dispatch({ type: 'START_REQUESTED', mode: 'screen', recordingId, ownerTabId });
     }
     return getRecordingState();
   });

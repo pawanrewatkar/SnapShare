@@ -4,7 +4,7 @@
  */
 import { platform } from '@/browser';
 import type { BackgroundRequest, CaptureMode } from '@/types/messages';
-import { completeRegion, requireSignIn, runCapture } from './capture';
+import { completeRegion, requireSignIn, runCapture, screenCaptured } from './capture';
 import { getSettings } from '@/services/settings';
 import {
   getRecordingState,
@@ -25,6 +25,8 @@ async function handle(msg: BackgroundRequest, sender: chrome.runtime.MessageSend
     case 'region:result':
       return completeRegion(msg.rect, msg.viewportWidth ?? 0, sender.tab?.id);
     case 'screen:captured':
+      // Screen/window screenshot taken in the recorder window: save to Drive and open the editor.
+      await screenCaptured(msg.captureId);
       return { ok: true };
     case 'rec:start':
       await requireSignIn();

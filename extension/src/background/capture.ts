@@ -93,6 +93,43 @@ async function afterCapture(captureId: string) {
   else await platform.openExtensionPage(`gallery.html?highlight=${encodeURIComponent(captureId)}`, { active: false });
 }
 
+type SplitTab = chrome.tabs.Tab & { splitViewId?: number };
+const inSplit = (t?: SplitTab | null) => !!t && t.splitViewId !== undefined && t.splitViewId !== -1;
+
+/**
+ * True when the browser window is currently showing a Chrome split view (Chrome 140+ `tab.splitViewId`).
+ * Chrome doesn't always report a split pane as `active`, so a window whose visible tabs are split
+ * panes (or that reports no active tab while it has split tabs) counts as split.
+ */
+export async function splitViewShown(tabId?: number): Promise<boolean> {
+  try {
+    const tab = tabId !== undefined ? ((await chrome.tabs.get(tabId)) as SplitTab) : null;
+    if (inSplit(tab)) return true;
+    const tabs = (await chrome.tabs.query(tab ? { windowId: tab.windowId } : { lastFocusedWindow: true })) as SplitTab[];
+    if (tabs.filter((t) => inSplit(t)).length < 2) return false;
+    const active = tabs.find((t) => t.active);
+    return !active || inSplit(active);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Opens the recorder page in its own small window (not a tab), so the window being captured
+ * — e.g. a split view — stays visible and is listed in Chrome's picker under its real title.
+ */
+export async function openRecorderWindow(query: Record<string, string>): Promise<number> {
+  const win = await chrome.windows.create({ url: chrome.runtime.getURL(`recorder.html?${new URLSearchParams(query)}`), type: 'popup', width: 780, height: 640, focused: true }); // wide enough for Chrome's 3-column picker
+  const tabId = win?.tabs?.[0]?.id;
+  if (tabId === undefined) throw new Error('Could not open the SnapShare recorder window');
+  return tabId;
+}
+
+/** A screen/window screenshot was saved by the recorder window: upload it to Drive and open the editor. */
+export async function screenCaptured(captureId: string): Promise<void> {
+  await afterCapture(captureId);
+}
+
 async function captureVisible(tab: TabInfo): Promise<CaptureResult> {
   const dataUrl = await throttledCapture(tab.windowId);
   const blob = await dataUrlToBlob(dataUrl);
@@ -192,14 +229,20 @@ async function captureFullPage(tab: TabInfo): Promise<CaptureResult> {
   }
 }
 
-async function captureScreen(): Promise<CaptureResult> {
-  // getDisplayMedia needs a visible document with the browser picker; the recorder page hosts it.
-  await platform.openExtensionPage('recorder.html?action=screenshot');
+async function captureScreen(split?: 'visible' | 'region'): Promise<CaptureResult> {
+  // getDisplayMedia needs a visible document with the browser picker; the recorder window hosts it.
+  await openRecorderWindow({ action: 'screenshot', ...(split ? { split: split } : {}) });
   return { ok: true };
 }
 
 export async function runCapture(mode: CaptureMode, tabId?: number): Promise<CaptureResult> {
   if (busy && mode !== 'screen') return { ok: false, error: 'Another capture is in progress' };
+  // Split view: one tab can't show both panes. The recorder window opens Chrome's window picker
+  // by itself (desktopCapture can't be called from the service worker without a target tab).
+  if ((mode === 'visible' || mode === 'region') && (await splitViewShown(tabId))) {
+    await openRecorderWindow({ action: 'screenshot', split: mode, auto: '1' });
+    return { ok: true };
+  }
   const tab = mode === 'screen' ? null : tabId !== undefined ? await platform.getTab(tabId) : await platform.getActiveTab();
   if (mode !== 'screen' && !tab) return { ok: false, error: 'No active tab to capture' };
   busy = true;
