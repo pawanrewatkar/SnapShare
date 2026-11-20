@@ -11,7 +11,9 @@ import type { CaptureMode, CaptureResult, PageMetrics, Rect } from '@/types/mess
 const CAPTURE_INTERVAL_MS = 550;
 let lastCaptureAt = 0;
 let busy = false;
-let pendingRegion: { tab: TabInfo } | null = null;
+/** Region capture: the screenshot is taken *before* the overlay appears ("frozen"), so pop-ups, drawers and
+ * menus that the overlay or a click would close are still in the image. Kept in memory only. */
+let pendingRegion: { tab: TabInfo; frozen?: string } | null = null;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -141,21 +143,25 @@ async function captureVisible(tab: TabInfo): Promise<CaptureResult> {
 }
 
 async function startRegion(tab: TabInfo): Promise<CaptureResult> {
+  // Freeze the page as it looks right now (open pop-up, cart drawer, menu…) before touching it.
+  const frozen = await throttledCapture(tab.windowId);
   await platform.injectContentScript(tab.id);
-  pendingRegion = { tab };
+  pendingRegion = { tab, frozen };
   await platform.storage.session.set('pendingRegion', tab);
-  await platform.sendToTab(tab.id, { type: 'region:select' });
+  await platform.sendToTab(tab.id, { type: 'region:select', frozen });
   return { ok: true };
 }
 
 /** Called when the content script reports the user's selection (or cancellation). */
 export async function completeRegion(rect: Rect | null, viewportWidth: number, senderTabId?: number): Promise<CaptureResult> {
   const tab = pendingRegion?.tab ?? (await platform.storage.session.get<TabInfo>('pendingRegion')) ?? null;
+  const frozen = pendingRegion?.tab.id === tab?.id ? pendingRegion?.frozen : undefined;
   pendingRegion = null;
   await platform.storage.session.remove('pendingRegion');
   if (!tab || (senderTabId !== undefined && senderTabId !== tab.id)) return { ok: false, error: 'No region capture in progress' };
   if (!rect) return { ok: false, error: 'cancelled' };
-  const dataUrl = await throttledCapture(tab.windowId);
+  // Use the frozen screenshot; only if the service worker restarted meanwhile, capture the page live.
+  const dataUrl = frozen ?? (await throttledCapture(tab.windowId));
   const full = await blobToBitmap(await dataUrlToBlob(dataUrl));
   const r = cssRectToImageRect(rect, viewportWidth, full.width, full.height);
   if (r.width < 1 || r.height < 1) {

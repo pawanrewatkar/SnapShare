@@ -76,7 +76,7 @@ export type BroadcastMessage =
 
 /** Messages from background to the injected content script. */
 export type ContentRequest =
-  | { type: 'region:select' }
+  | { type: 'region:select'; frozen?: string }
   | { type: 'page:metrics' }
   | { type: 'page:scrollTo'; y: number }
   | { type: 'page:prepare'; hideFixed: boolean }

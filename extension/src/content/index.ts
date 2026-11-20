@@ -138,7 +138,42 @@ const Z = '2147483647';
     progressHost = null;
   }
 
-  function startRegionSelection() {
+  /** Decodes a data: URL without fetch/img, so the page's Content-Security-Policy can't block it. */
+  async function dataUrlToBitmap(dataUrl: string): Promise<ImageBitmap> {
+    const [head, body] = dataUrl.split(',', 2);
+    const bin = atob(body);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return createImageBitmap(new Blob([bytes], { type: /data:([^;]+)/.exec(head)?.[1] ?? 'image/png' }));
+  }
+
+  /**
+   * Puts the overlay in the browser's top layer (a modal <dialog>), so it sits above site pop-ups that
+   * are themselves top-layer dialogs/popovers and isn't made inert by them. Falls back to a plain element.
+   */
+  function mountOverlay(host: HTMLElement): { root: HTMLElement; unmount: () => void } {
+    const dialog = document.createElement('dialog');
+    if (typeof (dialog as HTMLDialogElement).showModal === 'function') {
+      dialog.setAttribute('data-snapshare', 'region-layer');
+      const css: Record<string, string> = {
+        position: 'fixed', inset: '0', width: '100vw', height: '100vh', 'max-width': 'none', 'max-height': 'none',
+        margin: '0', padding: '0', border: '0', background: 'transparent', overflow: 'hidden', 'z-index': Z, display: 'block',
+      };
+      for (const [k, v] of Object.entries(css)) dialog.style.setProperty(k, v, 'important');
+      dialog.appendChild(host);
+      document.documentElement.appendChild(dialog);
+      try {
+        dialog.showModal();
+        return { root: dialog, unmount: () => { try { dialog.close(); } catch { /* already closed */ } dialog.remove(); } };
+      } catch {
+        dialog.remove();
+      }
+    }
+    document.documentElement.appendChild(host);
+    return { root: host, unmount: () => host.remove() };
+  }
+
+  function startRegionSelection(frozen?: string) {
     const host = document.createElement('div');
     host.setAttribute('data-snapshare', 'region');
     const shadow = host.attachShadow({ mode: 'open' });
@@ -150,6 +185,7 @@ const Z = '2147483647';
     const crossCursor = `url("data:image/svg+xml,${encodeURIComponent(cross)}") 16 16, crosshair`;
     shadow.innerHTML = `<style>
       .layer{position:fixed;inset:0;z-index:${Z};cursor:${crossCursor};user-select:none}
+      .frozen{position:absolute;left:0;top:0;width:100vw;height:100vh;pointer-events:none}
       .shade{position:absolute;background:rgba(15,23,42,.45);pointer-events:none}
       .sel{position:absolute;outline:2px solid #6366f1;box-shadow:0 0 0 1px rgba(255,255,255,.6) inset;pointer-events:none}
       .h{position:absolute;width:8px;height:8px;background:#fff;border:1.5px solid #6366f1;border-radius:2px;margin:-5px 0 0 -5px}
@@ -160,14 +196,34 @@ const Z = '2147483647';
       button{font:600 12px system-ui,sans-serif;border:0;border-radius:6px;padding:6px 10px;cursor:pointer}
       .ok{background:#6366f1;color:#fff}.cancel{background:#fff;color:#111827}
     </style>
-    <div class="layer"><div class="shade s1"></div><div class="shade s2"></div><div class="shade s3"></div><div class="shade s4"></div>
+    <div class="layer"><canvas class="frozen" hidden></canvas><div class="shade s1"></div><div class="shade s2"></div><div class="shade s3"></div><div class="shade s4"></div>
     <div class="sel" hidden>${['0,0', '50,0', '100,0', '0,50', '100,50', '0,100', '50,100', '100,100']
       .map((p) => `<div class="h" style="left:${p.split(',')[0]}%;top:${p.split(',')[1]}%"></div>`)
       .join('')}</div><div class="dims" hidden></div>
     <div class="actions"><button class="cancel">Cancel (Esc)</button><button class="ok">Capture (Enter)</button></div>
     <div class="hint">Drag to select an area · drag the selection to move or its edges to resize · Esc to cancel</div></div>`;
-    document.documentElement.appendChild(host);
+    const { root, unmount } = mountOverlay(host);
+    // Keep the site from seeing our clicks: many pop-ups, drawers and menus close on "click outside".
+    for (const type of ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'touchstart', 'touchend', 'contextmenu']) {
+      root.addEventListener(type, (e) => e.stopPropagation());
+    }
+    root.addEventListener('cancel', (e) => {
+      // Esc on the top-layer dialog: cancel the selection ourselves instead of letting the dialog close.
+      e.preventDefault();
+      void finish(false);
+    });
     const layer = shadow.querySelector('.layer') as HTMLElement;
+    if (frozen) {
+      // Show the screenshot taken before the overlay appeared, so what you select is exactly what's captured.
+      const canvas = shadow.querySelector('.frozen') as HTMLCanvasElement;
+      void dataUrlToBitmap(frozen).then((bmp) => {
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+        canvas.getContext('2d')?.drawImage(bmp, 0, 0);
+        bmp.close();
+        canvas.hidden = false;
+      }, () => undefined);
+    }
     const sel = shadow.querySelector('.sel') as HTMLElement;
     const dims = shadow.querySelector('.dims') as HTMLElement;
     const actions = shadow.querySelector('.actions') as HTMLElement;
@@ -206,7 +262,7 @@ const Z = '2147483647';
       if (done) return;
       done = true;
       window.removeEventListener('keydown', onKey, true);
-      host.remove();
+      unmount();
       await nextFrame();
       await wait(50);
       if (confirmed && rect.width >= 4 && rect.height >= 4) {
@@ -327,7 +383,7 @@ const Z = '2147483647';
     (async () => {
       switch (msg.type) {
         case 'region:select':
-          startRegionSelection();
+          startRegionSelection(msg.frozen);
           return { ok: true };
         case 'page:prepare': {
           hideFixedEnabled = msg.hideFixed;
